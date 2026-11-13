@@ -1,0 +1,59 @@
+# ============================================================
+# vanessa-resume-tool
+# 原则：代码、配置模板、脱敏示例入库；
+#       简历原文、上传文件、筛选结果、数据库、密钥一律不入库。
+# ============================================================
+
+# ---- Python 依赖与缓存 ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# ---- 打包产物（对应 exe 可行性实验的输出目录）----
+build/
+dist/
+*.exe
+
+# ---- 前端依赖（预留）----
+node_modules/
+
+# ---- 密钥与本地私有配置 ----
+# 真实 API Key 请放 .env 或 *.local.json，不要写进 providers.json
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.local.json
+
+# ---- 简历原文与上传文件（含姓名、手机号，禁止入库）----
+resume-screener/resumes/
+resume-tool/uploads/
+resumes/
+uploads/
+
+# ---- 筛选结果与本地数据库 ----
+*.db
+*.sqlite3
+report.csv
+screening_report.csv
+output/
+
+# ---- 日志 ----
+*.log
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 开发工具自身的会话数据 ----
+.workbuddy/
+
+# 注意：resume-tool/samples/ 是有意保留的脱敏示例数据，不要加进来。
+# 若哪天示例换成真实简历，再追加一行 resume-tool/samples/ 即可。

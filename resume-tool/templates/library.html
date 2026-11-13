@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, engine_cell, pager %}
+{% block title %}简历库{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>简历库</h1>
+    <p class="subtitle">
+      {% if tpl_label %}当前按「{{ tpl_label }}」查看，统计与结果仅统计该模板{% else %}状态取每份简历「最新一次筛选」结果（可切换按模板查看）{% endif %}
+    </p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('trash') }}">
+      回收站{% if trash_count %} <span class="count-pill">{{ trash_count }}</span>{% endif %}
+    </a>
+    <a class="btn btn-secondary" href="{{ url_for('persons') }}">按人查看</a>
+    <a class="btn btn-secondary" href="{{ url_for('export_xlsx', q=q or none, template=tpl_filter) }}">导出 xlsx 报告</a>
+    <a class="btn btn-secondary" href="{{ url_for('export_csv') }}">导出 CSV</a>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-num">{{ stats.total }}</div><div class="stat-label">简历总数</div></div>
+  <div class="stat-card"><div class="stat-num text-pass">{{ stats['通过'] }}</div><div class="stat-label">通过</div></div>
+  <div class="stat-card"><div class="stat-num text-review">{{ stats['待核实'] }}</div><div class="stat-label">待核实</div></div>
+  <div class="stat-card"><div class="stat-num text-fail">{{ stats['未通过'] }}</div><div class="stat-label">未通过</div></div>
+  <div class="stat-card"><div class="stat-num text-muted">{{ stats['未筛选'] }}</div><div class="stat-label">未筛选</div></div>
+</div>
+
+<div class="card">
+  <div class="card-title">批量导入</div>
+  <div class="import-grid">
+    <form method="post" action="{{ url_for('import_dir') }}" class="import-block">
+      <div class="import-block-title">方式一：本机目录导入</div>
+      <p class="hint">支持 .doc / .docx / .pdf / .txt / .md，按内容哈希自动去重</p>
+      <div class="inline-form">
+        <input type="text" name="dir" placeholder="例如 C:\resumes\2026-batch" required>
+        <button class="btn btn-primary" type="submit">导入目录</button>
+      </div>
+    </form>
+    <form method="post" action="{{ url_for('import_files') }}" enctype="multipart/form-data" class="import-block">
+      <div class="import-block-title">方式二：选择文件上传</div>
+      <p class="hint">可多选，上传后自动解析入库；回收站里的同内容文件会自动恢复</p>
+      <div class="upload-row">
+        <div class="dropzone" id="dropzone">
+          <input type="file" name="files" id="file-input" multiple
+                 accept=".doc,.docx,.pdf,.txt,.md,.markdown">
+          <label for="file-input" class="dropzone-label" id="dropzone-label">点击选择或拖拽文件到此处</label>
+        </div>
+        <button class="btn btn-primary upload-btn" type="submit">上传并导入</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card" id="list">
+  <div class="card-head">
+    <div class="card-title">简历列表
+      <span class="muted">（共 {{ pager_info.total }} 份{% if pager_info.pages > 1 %} · 第 {{ pager_info.page }}/{{ pager_info.pages }} 页{% endif %}）</span>
+    </div>
+    <div class="card-tools">
+      <form method="get" action="{{ url_for('library') }}" class="search-form">
+        <input type="hidden" name="template" value="{{ tpl_filter }}">
+        <input type="search" name="q" value="{{ q }}"
+               placeholder="搜索正文或文件名，如 算法、Kafka、985">
+        <button class="btn btn-sm btn-primary" type="submit">搜索</button>
+        {% if q %}<a class="btn btn-sm btn-secondary" href="{{ url_for('library', template=tpl_filter) }}">清除</a>{% endif %}
+      </form>
+      <form method="get" action="{{ url_for('library') }}" class="tpl-filter">
+        <input type="hidden" name="q" value="{{ q }}">
+        <select name="template" onchange="this.form.submit()" title="按模板查看">
+          <option value="all" {{ 'selected' if tpl_filter == 'all' }}>全部模板（取最新）</option>
+          {% for dept, items in templates|groupby('department') %}
+          <optgroup label="{{ dept }}">
+            {% for t in items %}
+            <option value="{{ t.slug }}" {{ 'selected' if tpl_filter == t.slug }}>{{ t.name }}{% if t.role %}（{{ t.role }}）{% endif %}</option>
+            {% endfor %}
+          </optgroup>
+          {% endfor %}
+        </select>
+      </form>
+      {% if resumes %}
+      <button class="icon-btn" id="multi-toggle" type="button" title="多选批量管理">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6l1.4 1.4L8 4.8M4 12l1.4 1.4L8 10.8M4 18l1.4 1.4L8 16.8"/></svg>
+      </button>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if q %}
+  <div class="search-summary">
+    全文搜索「<b>{{ q }}</b>」命中 <b>{{ resumes|length }}</b> 份
+    {% if tpl_label %}（已按「{{ tpl_label }}」模板口径统计）{% endif %}
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('resume_batch_delete') }}" id="batch-form">
+    {% if resumes %}
+    <div class="table-wrap">
+      <table class="table" id="resume-table">
+        <thead>
+          <tr>
+            <th class="th-check"><input type="checkbox" id="check-all" title="全选"></th>
+            <th>ID</th><th>文件名</th><th>字符数</th><th>关键词结果</th><th>AI 结果</th>
+            <th>结果模板</th><th>导入时间</th><th class="th-actions">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in resumes %}
+          <tr>
+            <td class="td-check"><input type="checkbox" class="row-check" name="ids" value="{{ r.id }}"></td>
+            <td class="muted">#{{ r.id }}</td>
+            <td>
+              <a class="link" href="{{ url_for('resume_detail', rid=r.id) }}">{{ r.filename }}</a>
+              {% if q %}<div class="snippet">{{ r.snippet }}</div>{% endif %}
+            </td>
+            <td class="muted">{{ r.chars }}</td>
+            <td>{{ engine_cell(r.keyword) }}</td>
+            <td>{{ engine_cell(r.ai) }}</td>
+            <td class="muted small">{{ r.best_template or '—' }}</td>
+            <td class="muted">{{ r.imported_at.replace('T', ' ') }}</td>
+            <td class="td-actions">
+              <a class="btn btn-xs" href="{{ url_for('resume_detail', rid=r.id) }}">详情</a>
+              <button class="btn btn-xs btn-danger-ghost" type="submit" form="single-del"
+                      formaction="{{ url_for('resume_delete', rid=r.id) }}"
+                      onclick="return confirm('将 #{{ r.id }} 移入回收站？（可恢复，磁盘文件保留）')">删除</button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% set pargs = {'template': tpl_filter} %}
+    {% if q %}{% set _ = pargs.update({'q': q}) %}{% endif %}
+    {{ pager(pager_info.page, pager_info.pages, pager_info.total, pager_info.per_page,
+             pager_info.window, 'library', pargs, '#list', '份') }}
+
+    <div class="batch-bar" id="batch-bar" hidden>
+      <span>已选 <b id="batch-count">0</b> 份</span>
+      <div class="batch-actions">
+        <button class="btn btn-secondary btn-sm" type="submit" formmethod="get"
+                formaction="{{ url_for('export_xlsx') }}">导出所选</button>
+        <button class="btn btn-danger btn-sm" type="submit" id="batch-delete">批量删除</button>
+        <button class="btn btn-secondary btn-sm" type="button" id="batch-cancel">退出多选</button>
+      </div>
+    </div>
+    {% else %}
+    <div class="empty">
+      {% if q %}没有命中「{{ q }}」的简历，换个关键词试试（支持正文与文件名，多个词用空格分隔）
+      {% elif tpl_filter != 'all' %}该模板下暂无简历，切换到「全部模板」查看
+      {% else %}简历库为空，先通过上方任一方式导入简历{% endif %}
+    </div>
+    {% endif %}
+  </form>
+  <form method="post" id="single-del" action=""></form>
+</div>
+
+{# ---------- 批量删除确认弹窗 ---------- #}
+<div class="modal-mask" id="batch-modal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">确认批量删除</div>
+        <div class="modal-sub">删除后可在回收站恢复</div>
+      </div>
+      <button class="modal-x" type="button" data-close="batch-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p>将把 <b id="modal-count">0</b> 份简历移入回收站。</p>
+      <p class="hint">筛选记录会保留，恢复后即可继续使用；磁盘上的原始文件不会被删除。</p>
+    </div>
+    <div class="modal-foot">
+      <label class="check-row">
+        <input type="checkbox" id="batch-skip"> 今日不再提示
+      </label>
+      <div class="modal-foot-actions">
+        <button class="btn btn-secondary" type="button" data-close="batch-modal">取消</button>
+        <button class="btn btn-danger" type="button" id="batch-confirm">移入回收站</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

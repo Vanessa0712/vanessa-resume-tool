@@ -1,0 +1,44 @@
+{
+  "name": "Python后端-P7",
+  "hard_gates": {
+    "required_skills": ["python", "sql"],
+    "min_years": 3,
+    "strict_years": false
+  },
+  "core_skills": {
+    "python": {
+      "weight": 30,
+      "aliases": ["python", "python3"]
+    },
+    "web_framework": {
+      "weight": 20,
+      "aliases": ["fastapi", "django", "flask"]
+    },
+    "sql": {
+      "weight": 20,
+      "aliases": ["sql", "mysql", "postgresql", "postgres", "sqlite"]
+    },
+    "engineering": {
+      "weight": 15,
+      "aliases": ["docker", "kubernetes", "k8s", "ci/cd", "gitlab ci", "github actions", "pytest", "单元测试"]
+    },
+    "async": {
+      "weight": 15,
+      "aliases": ["asyncio", "async/await", "异步", "uvicorn"]
+    }
+  },
+  "nice_to_have": {
+    "message_queue": {
+      "weight": 5,
+      "aliases": ["kafka", "rabbitmq", "rocketmq", "消息队列"]
+    },
+    "cache": {
+      "weight": 5,
+      "aliases": ["redis", "memcached", "缓存"]
+    },
+    "cloud": {
+      "weight": 5,
+      "aliases": ["aws", "阿里云", "腾讯云", "gcp", "azure"]
+    }
+  }
+}

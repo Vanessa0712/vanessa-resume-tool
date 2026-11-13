@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, pager %}
+{% block title %}简历详情{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>#{{ r.id }} {{ r.filename }}</h1>
+    <p class="subtitle">导入时间 {{ r.imported_at.replace('T', ' ') }} · 文本长度 {{ r.text|length }} 字符</p>
+  </div>
+  <div class="head-actions">
+    <button class="btn btn-primary" type="button" id="preview-open" {{ '' if file_info.exists else 'disabled' }}>预览原文件</button>
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+  </div>
+</div>
+
+{% if deleted %}
+<div class="banner-warn">
+  <span>该简历在回收站中{% if r.deleted_at %}（{{ r.deleted_at.replace('T', ' ') }} 删除）{% endif %}，库内筛选与统计不包含它。</span>
+  <form method="post" action="{{ url_for('trash_restore', rid=r.id) }}" class="inline">
+    <button class="btn btn-sm btn-primary" type="submit">恢复此简历</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title">原文件</div>
+  {% if file_info.exists %}
+  <div class="file-line">
+    <div class="file-meta">
+      <div class="file-path" title="{{ file_info.path }}">{{ file_info.path }}</div>
+      <div class="hint" style="margin:4px 0 0">{{ file_info.ext or '无扩展名' }} · {{ file_info.size_kb }} KB</div>
+    </div>
+    <a class="btn btn-secondary btn-sm" href="{{ url_for('resume_raw', rid=r.id, download=1) }}">下载</a>
+  </div>
+
+  <form method="post" action="{{ url_for('resume_open', rid=r.id) }}" class="open-row" id="open-form">
+    <label class="form-label" for="open-method">打开方式</label>
+    <select name="method" id="open-method">
+      {% for key, label in open_methods.items() %}
+      <option value="{{ key }}" {{ 'selected' if key == app_settings.preview_method }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn btn-primary" type="submit">用此方式打开</button>
+    <button class="btn btn-secondary" type="button" id="cloud-open" data-path="{{ file_info.path }}">复制路径并打开云文档</button>
+  </form>
+  <p class="hint">打开方式会调用本机程序（WPS / Word / 资源管理器），仅在 127.0.0.1 本地生效；云文档会复制文件路径并打开网盘网页，需自行上传</p>
+  {% else %}
+  <div class="empty">原文件已不在原路径（可能被移动或删除）：{{ file_info.path }}<br>仍可查看下方已解析的文本内容</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="card-title">解析文本预览</div>
+  <pre class="resume-text">{{ r.text }}</pre>
+</div>
+
+<div class="card" id="history">
+  <div class="card-head">
+    <div class="card-title">筛选历史
+      <span class="muted">（共 {{ pager_info.total }} 次{% if pager_info.pages > 1 %} · 第 {{ pager_info.page }}/{{ pager_info.pages }} 页{% endif %}）</span>
+    </div>
+    {% if pager_info.pages > 1 %}<span class="muted small">每页 {{ pager_info.per_page }} 条</span>{% endif %}
+  </div>
+
+  {% if history %}
+  <table class="table">
+    <thead><tr><th>时间</th><th>引擎</th><th>模板</th><th>结果</th><th>分数</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for h in history %}
+      <tr>
+        <td class="muted">{{ h.created_at.replace('T', ' ') }}</td>
+        <td>{{ '关键词' if h.engine == 'keyword' else 'AI' }}</td>
+        <td>{{ h.template }}</td>
+        <td>{{ badge(h.status) }}</td>
+        <td class="score">{{ h.score }}</td>
+        <td class="reason">{{ h.detail.get('reason', '') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {{ pager(pager_info.page, pager_info.pages, pager_info.total, pager_info.per_page,
+           pager_info.window, 'resume_detail', {'rid': r.id}, '#history', '次') }}
+  {% else %}
+  <div class="empty">尚无筛选记录</div>
+  {% endif %}
+</div>
+
+{# ---------- 原文件预览弹窗 ---------- #}
+{% if file_info.exists %}
+<div class="modal-mask" id="preview-modal" hidden>
+  <div class="modal modal-preview">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">{{ r.filename }}</div>
+        <div class="modal-sub">{{ file_info.ext }} · {{ file_info.size_kb }} KB</div>
+      </div>
+      <button class="modal-x" type="button" data-close="preview-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body modal-body-flush">
+      {% if file_info.inline %}
+      <iframe class="preview-frame" src="{{ url_for('resume_raw', rid=r.id) }}" title="原文件预览"></iframe>
+      {% else %}
+      <div class="preview-fallback">
+        <p>该格式（{{ file_info.ext }}）浏览器无法内嵌渲染。</p>
+        <p class="hint">请选择下方方式用本机程序打开，或直接下载后查看。</p>
+        <div class="preview-fallback-actions">
+          <button class="btn btn-primary" type="button" data-open="wps">用 WPS 打开</button>
+          <button class="btn btn-secondary" type="button" data-open="word">用 Word 打开</button>
+          <button class="btn btn-secondary" type="button" data-open="default">用系统默认程序打开</button>
+          <a class="btn btn-secondary" href="{{ url_for('resume_raw', rid=r.id, download=1) }}">下载文件</a>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    <div class="modal-foot">
+      <span class="hint">在浏览器内预览仅支持 PDF / 纯文本</span>
+      <button class="btn btn-secondary" type="button" data-close="preview-modal">关闭</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const methodSel = document.getElementById('open-method');
+  const form = document.getElementById('open-form');
+
+  // 「预览原文件」打开预览弹窗
+  const previewBtn = document.getElementById('preview-open');
+  if (previewBtn) previewBtn.addEventListener('click', () => openModal('preview-modal'));
+
+  // 弹窗里的快捷打开按钮：设置对应方式后提交同一个表单
+  document.querySelectorAll('[data-open]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!form) return;
+      methodSel.value = btn.dataset.open;
+      form.submit();
+    });
+  });
+  // 云文档：复制本地路径 + 打开网盘网页（不自动上传）
+  const cloud = document.getElementById('cloud-open');
+  if (cloud) {
+    cloud.addEventListener('click', async () => {
+      const path = cloud.dataset.path;
+      try { await navigator.clipboard.writeText(path); } catch (e) { /* 剪贴板不可用时静默 */ }
+      cloud.textContent = '路径已复制，请到云文档粘贴上传';
+      if (window.RT && window.RT.cloudUrl) window.open(window.RT.cloudUrl, '_blank');
+    });
+  }
+})();
+</script>
+{% endblock %}

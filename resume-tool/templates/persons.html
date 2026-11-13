@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, engine_cell, pager %}
+{% block title %}候选人{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>候选人</h1>
+    <p class="subtitle">同一人的多份简历自动归并为一个候选人（按邮箱 → 手机 → 姓名匹配），列表展示最新版本</p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">按文件查看</a>
+    <a class="btn btn-secondary" href="{{ url_for('export_xlsx') }}">导出全部 xlsx</a>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-num">{{ stats.persons }}</div><div class="stat-label">候选人总数</div></div>
+  <div class="stat-card"><div class="stat-num">{{ stats.multi }}</div><div class="stat-label">多版本候选人</div></div>
+  <div class="stat-card"><div class="stat-num text-pass">{{ stats['通过'] }}</div><div class="stat-label">最新版本通过</div></div>
+  <div class="stat-card"><div class="stat-num text-review">{{ stats['待核实'] }}</div><div class="stat-label">待核实</div></div>
+  <div class="stat-card"><div class="stat-num text-fail">{{ stats['未通过'] }}</div><div class="stat-label">未通过</div></div>
+</div>
+
+<div class="card" id="list">
+  <div class="card-head">
+    <div class="card-title">候选人列表
+      <span class="muted">（共 {{ pager_info.total }} 人{% if pager_info.pages > 1 %} · 第 {{ pager_info.page }}/{{ pager_info.pages }} 页{% endif %}）</span>
+    </div>
+    <div class="card-tools">
+      <form method="get" action="{{ url_for('persons') }}" class="search-form">
+        <input type="search" name="q" value="{{ q }}" placeholder="在简历正文中搜索，如 数据、Kafka">
+        <button class="btn btn-sm btn-primary" type="submit">搜索</button>
+        {% if q %}<a class="btn btn-sm btn-secondary" href="{{ url_for('persons') }}">清除</a>{% endif %}
+      </form>
+    </div>
+  </div>
+
+  {% if q %}
+  <div class="search-summary">搜索「<b>{{ q }}</b>」，命中 <b>{{ pager_info.total }}</b> 位候选人（版本数按该候选人的全部简历统计）</div>
+  {% endif %}
+
+  {% if items %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr><th>姓名</th><th>联系方式</th><th>版本</th><th>最新简历</th>
+            <th>关键词结果</th><th>AI 结果</th><th>结果模板</th><th>最近导入</th>
+            <th class="th-actions">操作</th><th class="th-corner"></th></tr>
+      </thead>
+      <tbody>
+        {% for it in items %}
+        <tr>
+          <td>
+            <a class="link" href="{{ url_for('person_detail', pid=it.person_id) if it.person_id else url_for('resume_detail', rid=it.latest.id) }}">
+              {{ it.name }}
+            </a>
+          </td>
+          <td class="muted small">
+            {% if it.phone %}{{ it.phone }}{% endif %}
+            {% if it.phone and it.email %}<br>{% endif %}
+            {% if it.email %}{{ it.email }}{% endif %}
+            {% if not it.phone and not it.email %}—{% endif %}
+          </td>
+          <td class="muted">{{ it.count }}</td>
+          <td><a class="link" href="{{ url_for('resume_detail', rid=it.latest.id) }}">{{ it.latest.filename }}</a></td>
+          <td>{{ engine_cell(it.keyword) }}</td>
+          <td>{{ engine_cell(it.ai) }}</td>
+          <td class="muted small">{{ it.template or '—' }}</td>
+          <td class="muted">{{ it.latest.imported_at.replace('T', ' ') }}</td>
+          <td class="td-actions">
+            {% if it.person_id %}<a class="btn btn-xs" href="{{ url_for('person_detail', pid=it.person_id) }}">版本</a>{% endif %}
+            <a class="btn btn-xs" href="{{ url_for('resume_detail', rid=it.latest.id) }}">详情</a>
+          </td>
+          <td class="td-corner">
+            {% if it.multi %}
+            <a class="ver-bubble" title="该候选人有 {{ it.count }} 份简历，点开看版本对比"
+               href="{{ url_for('person_detail', pid=it.person_id) if it.person_id else url_for('resume_detail', rid=it.latest.id) }}">
+              多版本 · {{ it.count }}
+            </a>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {{ pager(pager_info.page, pager_info.pages, pager_info.total, pager_info.per_page,
+           pager_info.window, 'persons', ({'q': q} if q else {}), '#list', '人') }}
+  {% else %}
+  <div class="empty">
+    {% if q %}没有命中「{{ q }}」的候选人{% else %}简历库为空，先导入简历{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

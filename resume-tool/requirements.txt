@@ -1,0 +1,7 @@
+# 运行依赖（Python 3.10+）
+flask>=3.0          # Web UI 服务
+pypdf>=4.0          # PDF 文本抽取（缺失时 PDF 简历会跳过并提示）
+openpyxl>=3.1       # 导出 xlsx 候选人报告（缺失时页面提示安装）
+
+# 开发/自检用（非运行时必需）
+# websocket-client  # tools/screenshot.py 通过 Chrome DevTools Protocol 截图

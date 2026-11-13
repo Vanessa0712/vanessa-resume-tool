@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}图表视图{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>图表视图</h1>
+    <p class="subtitle">简历库与筛选结果的可视化概览，全部本地计算、无外部图表库依赖</p>
+  </div>
+  <div class="head-actions">
+    {% if trash_n %}
+    <a class="btn btn-secondary" href="{{ url_for('trash') }}">回收站 {{ trash_n }} 份</a>
+    {% endif %}
+    <a class="btn btn-secondary" href="{{ url_for('export_csv') }}">导出明细 CSV</a>
+  </div>
+</div>
+
+<div class="stats-grid stats-grid-6">
+  <div class="stat-card"><div class="stat-num">{{ kpi.total }}</div><div class="stat-label">简历总数</div></div>
+  <div class="stat-card"><div class="stat-num">{{ kpi.screened_pct }}%</div><div class="stat-label">已筛选 {{ kpi.screened }} 份</div></div>
+  <div class="stat-card"><div class="stat-num text-pass">{{ kpi.pass_rate }}%</div><div class="stat-label">整体通过率</div></div>
+  <div class="stat-card"><div class="stat-num">{{ kpi.avg_score if kpi.avg_score is not none else '—' }}</div><div class="stat-label">平均分</div></div>
+  <div class="stat-card"><div class="stat-num">{{ kpi.ai_cover }}%</div><div class="stat-label">AI 覆盖率</div></div>
+  <div class="stat-card"><div class="stat-num">{{ kpi.agree_rate if kpi.agree_rate is not none else '—' }}{{ '%' if kpi.agree_rate is not none }}</div><div class="stat-label">双引擎一致率</div></div>
+</div>
+
+<div class="chart-grid">
+  <div class="card">
+    <div class="card-title">筛选状态分布</div>
+    <div class="donut-wrap">
+      <div class="donut" style="background: {{ donut }}"><div class="donut-hole">{{ kpi.total }}<span>份</span></div></div>
+      <ul class="legend">
+        <li><i style="background:#5E8C61"></i>通过 <b>{{ status_counts['通过'] }}</b></li>
+        <li><i style="background:#C89B3C"></i>待核实 <b>{{ status_counts['待核实'] }}</b></li>
+        <li><i style="background:#BF4D43"></i>未通过 <b>{{ status_counts['未通过'] }}</b></li>
+        <li><i style="background:#C9C4B8"></i>未筛选 <b>{{ status_counts['未筛选'] }}</b></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">分数分布 <span class="muted">（20 分一档，取每份简历最佳结果）</span></div>
+    <div class="hbar-list">
+      {% for h in hist %}
+      <div class="hbar-row">
+        <span class="hbar-label">{{ h.label }}</span>
+        <div class="hbar-track"><div class="hbar-fill" style="width: {{ (h.count / hist_max * 100) | round(1) }}%"></div></div>
+        <span class="hbar-value">{{ h.count }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">各模板通过率 <span class="muted">（按通过率排序）</span></div>
+    {% if tpl_stats %}
+    <div class="hbar-list">
+      {% for t in tpl_stats %}
+      <div class="hbar-row">
+        <span class="hbar-label" title="{{ t.name }}">{{ t.name }}</span>
+        <div class="hbar-track">
+          <div class="hbar-fill hbar-fill-pass" style="width: {{ t.pass_rate }}%"></div>
+        </div>
+        <span class="hbar-value">{{ t.pass_rate }}%</span>
+      </div>
+      <div class="hbar-note">
+        共 {{ t.total }} 份 · 通过 {{ t['通过'] }} / 待核实 {{ t['待核实'] }} / 未通过 {{ t['未通过'] }}
+        {% if t.avg_score is not none %} · 均分 {{ t.avg_score }}{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">尚无模板</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-title">技能命中热度 <span class="muted">（关键词证据累计次数 TOP10）</span></div>
+    {% if top_skills %}
+    <div class="hbar-list">
+      {% for name, count in top_skills %}
+      <div class="hbar-row">
+        <span class="hbar-label">{{ name }}</span>
+        <div class="hbar-track"><div class="hbar-fill hbar-fill-skill" style="width: {{ (count / skill_max * 100) | round(1) }}%"></div></div>
+        <span class="hbar-value">{{ count }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">尚无关键词筛选数据</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">导入趋势 <span class="muted">（按日）</span></div>
+  {% if trend_items %}
+  <div class="vchart">
+    {% for item in trend_items %}
+    <div class="vbar-col" title="{{ item.label }}：{{ item.count }} 份">
+      <span class="vbar-value">{{ item.count }}</span>
+      <div class="vbar" style="height: {{ (item.count / trend_max * 100) | round(1) }}%"></div>
+      <span class="vbar-label">{{ item.label[5:] }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">尚无导入记录</div>
+  {% endif %}
+</div>
+{% endblock %}

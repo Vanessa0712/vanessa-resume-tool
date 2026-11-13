@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}模板管理{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>模板管理</h1>
+    <p class="subtitle">筛选模板 = 必备门槛 + 核心技能权重 + 加分项，一个岗位一份模板</p>
+  </div>
+  <a class="btn btn-secondary" href="{{ url_for('templates_export_all') }}">
+    <svg class="btn-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></svg>
+    导出全部模板
+  </a>
+</div>
+
+<div class="card">
+  <div class="card-title">新建模板</div>
+  <form method="post" action="{{ url_for('template_new') }}" class="inline-form">
+    <input type="text" name="slug" placeholder="模板文件名，如 data-analyst（小写字母/数字/连字符）" required>
+    <button class="btn btn-primary" type="submit">基于默认模板创建</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">批量导入模板 <span class="muted">（可多选 .json）</span></div>
+  <form method="post" action="{{ url_for('template_import') }}" enctype="multipart/form-data" class="upload-row">
+    <div class="dropzone" id="tpl-dropzone">
+      <input type="file" name="files" id="tpl-file-input" multiple accept=".json">
+      <label for="tpl-file-input" class="dropzone-label" id="tpl-dropzone-label">点击选择或拖拽模板 JSON 到此处</label>
+    </div>
+    <button class="btn btn-primary upload-btn" type="submit">导入模板</button>
+  </form>
+  <p class="hint">逐个校验结构，合法才写入；同名文件自动追加序号，不覆盖现有模板</p>
+</div>
+
+<div class="tpl-grid">
+  {% for t in templates %}
+  <div class="card tpl-card">
+    <div class="tpl-name">
+      {{ t.name }}
+      <button class="tpl-star {{ 'on' if t.slug in favorites }}" type="button"
+              data-fav="{{ t.slug }}" title="收藏/取消收藏"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.6l2.6 5.2 5.8.9-4.2 4.1 1 5.8-5.2-2.8-5.2 2.8 1-5.8L3.6 9.7l5.8-.9z"/></svg></button>
+    </div>
+    <div class="tpl-slug">
+      {{ t.slug }}.json
+      <span class="tpl-role">{{ t.department }}{% if t.role %} · {{ t.role }}{% endif %}</span>
+    </div>
+    <dl class="tpl-meta">
+      <div><dt>必备技能</dt><dd>{{ t.required }}</dd></div>
+      <div><dt>最低年限</dt><dd>{{ t.min_years if t.min_years is not none else '不限' }}</dd></div>
+      <div><dt>核心技能</dt><dd>{{ t.core_count }} 项</dd></div>
+      <div><dt>加分项</dt><dd>{{ t.nice_count }} 项</dd></div>
+    </dl>
+    <div class="tpl-actions">
+      <a class="btn btn-primary btn-sm" href="{{ url_for('template_edit', slug=t.slug) }}">编辑模板</a>
+      <a class="btn btn-secondary btn-sm" href="{{ url_for('template_export', slug=t.slug) }}">导出 JSON</a>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

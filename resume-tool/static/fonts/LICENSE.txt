@@ -1,0 +1,8 @@
+本目录字体为 Noto Serif SC（SIL Open Font License 1.1），
+仅做字形子集化（保留 GB2312 全字集 + 界面文案用字），未修改字形。
+
+来源：https://fonts.google.com/noto/specimen/Noto+Serif+SC
+打包方式：@fontsource/noto-serif-sc@5.0.0（woff2）
+重建：python tools/build_fonts.py（需 fonttools + brotli）
+
+OFL 1.1 全文：https://scripts.sil.org/OFL

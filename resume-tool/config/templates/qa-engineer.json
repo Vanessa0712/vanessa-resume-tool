@@ -1,0 +1,80 @@
+{
+  "name": "测试工程师-QA",
+  "hard_gates": {
+    "required_skills": [
+      "testing"
+    ],
+    "min_years": 2,
+    "strict_years": false
+  },
+  "core_skills": {
+    "testing": {
+      "weight": 30,
+      "aliases": [
+        "测试",
+        "test",
+        "qa",
+        "质量保证"
+      ]
+    },
+    "automation": {
+      "weight": 25,
+      "aliases": [
+        "自动化测试",
+        "selenium",
+        "playwright",
+        "appium",
+        "pytest",
+        "unittest"
+      ]
+    },
+    "python": {
+      "weight": 20,
+      "aliases": [
+        "python",
+        "python3"
+      ]
+    },
+    "sql": {
+      "weight": 15,
+      "aliases": [
+        "sql",
+        "mysql",
+        "postgresql",
+        "postgres",
+        "sqlite"
+      ]
+    },
+    "performance": {
+      "weight": 10,
+      "aliases": [
+        "性能测试",
+        "jmeter",
+        "loadrunner",
+        "压测"
+      ]
+    }
+  },
+  "nice_to_have": {
+    "ci": {
+      "weight": 5,
+      "aliases": [
+        "ci/cd",
+        "jenkins",
+        "gitlab ci",
+        "github actions"
+      ]
+    },
+    "api_test": {
+      "weight": 5,
+      "aliases": [
+        "接口测试",
+        "postman",
+        "apifox",
+        "requests"
+      ]
+    }
+  },
+  "department": "IT",
+  "role": "测试"
+}

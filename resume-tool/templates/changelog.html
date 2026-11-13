@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}更新日志{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>更新日志</h1>
+    <p class="subtitle">历史公告与版本变更记录，点标题可展开/收起详情</p>
+  </div>
+  <div class="head-actions">
+    <span class="badge badge-review">{{ entries|length }} 个版本</span>
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+  </div>
+</div>
+
+<div class="log-list">
+  {% for item in entries %}
+  <details class="card log-card {{ 'log-current' if loop.first }}" {{ 'open' if loop.first }}>
+    <summary class="log-summary">
+      <div class="log-head">
+        <div class="log-title-wrap">
+          {% if loop.first %}<span class="ver-chip ver-chip-new">当前版本</span>{% endif %}
+          <span class="log-ver">{{ item.version }}</span>
+          {% if item.channel %}<span class="beta-chip">{{ item.channel }}</span>{% endif %}
+          <span class="log-date">{{ item.date }}</span>
+        </div>
+        <div class="log-meta">
+          <span class="muted small">{{ item.entries|length }} 项变更</span>
+          <svg class="log-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+        </div>
+      </div>
+      <div class="log-title">{{ item.title }}</div>
+    </summary>
+    <ul class="log-entries">
+      {% for line in item.entries %}
+      <li>{{ line }}</li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% else %}
+  <div class="card"><div class="empty">暂无更新记录</div></div>
+  {% endfor %}
+</div>
+
+<p class="hint">版本记录维护在 <code>app.py</code> 的 <code>CHANGELOG</code> 中，新增一条即可自动出现在此页与进入时的公告弹窗。</p>
+{% endblock %}

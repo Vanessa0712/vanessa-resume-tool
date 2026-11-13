@@ -1,0 +1,51 @@
+{% macro badge(status) -%}
+  {%- if status -%}
+    <span class="badge {{ 'badge-pass' if status == '通过' else ('badge-review' if status == '待核实' else 'badge-fail') }}">{{ status }}</span>
+  {%- else -%}
+    <span class="muted">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro engine_cell(row) -%}
+  {%- if row -%}
+    {{ badge(row.status) }}<span class="score">{{ row.score }}</span>
+  {%- else -%}
+    <span class="muted">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# 通用分页条：翻页 + 页码窗口（首尾页 + 当前±2）+ 页码跳转。
+   endpoint 传路由名，args 传需要保留的查询参数（如 {'q': q, 'template': tpl}）。 #}
+{% macro pager(page, pages, total, per_page, window, endpoint, args={}, anchor='', unit='条') -%}
+{%- if pages > 1 -%}
+<div class="pager">
+  <span class="muted small">
+    第 {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total]|min }} {{ unit }} / 共 {{ total }} {{ unit }}
+  </span>
+  <div class="pager-actions">
+    {% if page > 1 %}
+    <a class="page-btn" href="{{ url_for(endpoint, page=page - 1, **args) }}{{ anchor }}">上一页</a>
+    {% else %}<span class="page-btn disabled">上一页</span>{% endif %}
+
+    {% for p in window %}
+      {% if p == '…' %}
+      <span class="page-ellipsis">…</span>
+      {% elif p == page %}
+      <span class="page-btn active">{{ p }}</span>
+      {% else %}
+      <a class="page-btn" href="{{ url_for(endpoint, page=p, **args) }}{{ anchor }}">{{ p }}</a>
+      {% endif %}
+    {% endfor %}
+
+    {% if page < pages %}
+    <a class="page-btn" href="{{ url_for(endpoint, page=page + 1, **args) }}{{ anchor }}">下一页</a>
+    {% else %}<span class="page-btn disabled">下一页</span>{% endif %}
+
+    <form method="get" action="{{ url_for(endpoint, **args) }}" class="pager-jump">
+      <input type="number" name="page" min="1" max="{{ pages }}" placeholder="页码" required>
+      <button class="btn btn-xs" type="submit">跳转</button>
+    </form>
+  </div>
+</div>
+{%- endif -%}
+{%- endmacro %}

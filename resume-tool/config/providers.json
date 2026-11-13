@@ -1,0 +1,23 @@
+{
+  "active": "deepseek",
+  "providers": {
+    "deepseek": {
+      "label": "DeepSeek",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "model": "deepseek-chat"
+    },
+    "moonshot": {
+      "label": "Moonshot Kimi",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api_key": "",
+      "model": "moonshot-v1-8k"
+    },
+    "custom": {
+      "label": "自定义(OpenAI兼容)",
+      "base_url": "",
+      "api_key": "",
+      "model": ""
+    }
+  }
+}

@@ -1,0 +1,6 @@
+李四 — 前端工程师
+
+工作年限：4年前端开发经验
+
+技能：JavaScript / TypeScript / React / Vue / Webpack / Vite。
+了解 Node.js。希望转全栈方向。

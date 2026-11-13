@@ -1,0 +1,50 @@
+{
+  "name": "电气开发",
+  "department": "电气",
+  "role": "电气开发",
+  "hard_gates": {
+    "required_skills": [
+      "engineering"
+    ],
+    "min_years": 3,
+    "strict_years": false
+  },
+  "core_skills": {
+    "sql": {
+      "weight": 20,
+      "aliases": [
+        "sql",
+        "mysql",
+        "postgresql",
+        "postgres",
+        "sqlite"
+      ]
+    },
+    "engineering": {
+      "weight": 15,
+      "aliases": [
+        "docker",
+        "kubernetes",
+        "k8s",
+        "ci/cd",
+        "gitlab",
+        "ci",
+        "github",
+        "actions",
+        "pytest",
+        "单元测试"
+      ]
+    }
+  },
+  "nice_to_have": {
+    "message_queue": {
+      "weight": 5,
+      "aliases": [
+        "kafka",
+        "rabbitmq",
+        "rocketmq",
+        "消息队列"
+      ]
+    }
+  }
+}

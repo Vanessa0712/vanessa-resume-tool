@@ -1,0 +1,507 @@
+{% extends "base.html" %}
+{% from "_macros.html" import engine_cell %}
+{% block title %}筛选中心{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>筛选中心</h1>
+    <p class="subtitle">勾选一个或多个模板与引擎，对库内简历批量评分排序</p>
+  </div>
+</div>
+
+<div class="card">
+  <form method="post" action="{{ url_for('screen_run') }}" id="screen-form">
+    <div class="form-row">
+      <label class="form-label">筛选模板
+        <span class="muted">（可多选 · 搜索模板名或技能 · ★ 收藏置顶）</span>
+        <a class="link small" href="{{ url_for('templates_page') }}">管理模板</a>
+      </label>
+
+      <div class="tpl-select" id="tpl-select">
+        <div class="tpl-box" id="tpl-box">
+          <div class="tpl-chips" id="tpl-chips"></div>
+          <input type="text" id="tpl-search" class="tpl-search" autocomplete="off"
+                 placeholder="搜索模板名或技能，点右侧展开全部">
+          <button type="button" class="tpl-toggle" id="tpl-toggle">
+            全部 {{ templates|length }} <span class="tpl-caret">▾</span>
+          </button>
+        </div>
+        <div class="tpl-panel" id="tpl-panel" hidden>
+          <div class="tpl-panel-head">
+            <span class="muted small" id="tpl-count-text">已选 0 个</span>
+            <div class="tpl-panel-tools">
+              <button type="button" class="btn btn-xs" id="tpl-select-all">全选当前结果</button>
+              <button type="button" class="btn btn-xs" id="tpl-clear">清空</button>
+            </div>
+          </div>
+          <div class="tpl-options" id="tpl-options"></div>
+          <div class="tpl-empty" id="tpl-empty" hidden>没有匹配的模板，试试其他关键词</div>
+        </div>
+      </div>
+      <div id="tpl-hidden"></div>
+      <p class="hint" id="tpl-cost" style="margin-bottom:0"></p>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">筛选引擎</label>
+      <div class="engine-grid">
+        {% for key, e in engines.items() %}
+        <label class="engine-card">
+          <input type="radio" name="engine" value="{{ key }}" {{ 'checked' if key == (job.engine if job and job.engine else 'funnel') }} required>
+          <span class="engine-name">{{ e.label }}</span>
+          <span class="engine-desc">{{ e.desc }}</span>
+          {% if e.need_ai %}<span class="engine-tag {{ 'tag-ok' if ai_ready else 'tag-warn' }}">{{ 'AI 已就绪' if ai_ready else '需先配置 API Key' }}</span>{% endif %}
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">简历范围</label>
+      <div class="scope-tabs" id="scope-tabs">
+        <label class="scope-tab"><input type="radio" name="scope" value="all" checked><span>全部简历</span></label>
+        <label class="scope-tab"><input type="radio" name="scope" value="unscreened"><span>仅未筛选（按所选模板）</span></label>
+        <label class="scope-tab"><input type="radio" name="scope" value="selected"><span>指定简历</span></label>
+      </div>
+
+      <div class="picker" id="picker" hidden>
+        <div class="picker-bar">
+          <input type="text" id="picker-search" placeholder="搜索文件名或 ID，例如 张三 / #12 / python">
+          <select id="picker-status">
+            <option value="">全部状态</option>
+            <option value="通过">通过</option>
+            <option value="待核实">待核实</option>
+            <option value="未通过">未通过</option>
+            <option value="未筛选">未筛选</option>
+          </select>
+        </div>
+        <div class="picker-tools">
+          <button class="btn btn-xs" type="button" id="pick-all">全选当前结果</button>
+          <button class="btn btn-xs" type="button" id="pick-clear">清空</button>
+          <span class="muted small" id="pick-count">已选 0 份</span>
+        </div>
+        <div class="picker-list" id="picker-list">
+          {% for r in resumes %}
+          <label class="pick-row" data-id="{{ r.id }}" data-status="{{ r.status }}"
+                 data-search="{{ r.id }} {{ r.filename|lower }}">
+            <input type="checkbox" class="pick-item" value="{{ r.id }}">
+            <span class="pick-id">#{{ r.id }}</span>
+            <span class="pick-file">{{ r.filename }}</span>
+            <span class="badge badge-{{ 'pass' if r.status == '通过' else 'review' if r.status == '待核实' else 'fail' if r.status == '未通过' else 'none' }}">{{ r.status }}</span>
+            {% if r.score is not none %}<span class="muted small">{{ r.score }}</span>{% endif %}
+          </label>
+          {% endfor %}
+          {% if not resumes %}<div class="empty">简历库为空</div>{% endif %}
+        </div>
+      </div>
+      <input type="hidden" name="ids" id="ids-field" value="">
+    </div>
+
+    <button class="btn btn-primary btn-lg" type="submit" id="screen-submit">开始筛选</button>
+    <span class="hint" id="run-hint"></span>
+  </form>
+</div>
+
+{# ---------- 后台任务进度 / 结果摘要 ---------- #}
+{% if job %}
+{% set state_text = '已完成' if job.state == 'done' else ('失败' if job.state == 'error' else '进行中') %}
+<div class="card job-card {{ 'job-card-done' if job.state == 'done' else 'job-card-fail' if job.state == 'error' }}"
+     id="job-card" data-state="{{ job.state }}"
+     data-url="{{ url_for('screen_job', jid=job.id) }}"
+     data-done-url="{{ url_for('screen', templates=slugs|join(','), job=job.id) }}">
+  <div class="card-head">
+    <div class="card-title">筛选任务 <span class="muted" id="job-state">{{ state_text }}</span></div>
+    <span class="muted small" id="job-count">{{ job.done }} / {{ job.total or '?' }}</span>
+  </div>
+  <div class="progress"><div class="progress-fill" id="job-fill" style="width: {{ job.pct }}%"></div></div>
+  <p class="hint" style="margin-bottom:0" id="job-line">
+    {% if job.state == 'done' or job.state == 'error' %}
+      {{ job.message }}
+    {% else %}
+      当前处理：<span id="job-current">{{ job.current or '准备中' }}</span> · 可离开本页，任务在后台继续
+    {% endif %}
+  </p>
+  {% if job.errors %}
+  <ul class="job-errors">
+    {% for err in job.errors[:3] %}<li>{{ err }}</li>{% endfor %}
+    {% if job.errors|length > 3 %}<li>…共 {{ job.errors|length }} 条失败记录</li>{% endif %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
+
+{% for block in results_by_tpl %}<div class="card">
+  <div class="card-title">
+    {{ block.name }}
+    <span class="muted">（共 {{ block.rows|length }} 份 · 通过 {{ block.counts['通过'] }} · 待核实 {{ block.counts['待核实'] }} · 未通过 {{ block.counts['未通过'] }}）</span>
+  </div>
+  {% if block.rows %}
+  <table class="table">
+    <thead>
+      <tr><th>排名</th><th>简历</th><th>关键词结果</th><th>AI 结果</th><th>判定说明</th></tr>
+    </thead>
+    <tbody>
+      {% for item in block.rows %}
+      <tr>
+        <td class="muted">{{ loop.index }}</td>
+        <td><a class="link" href="{{ url_for('resume_detail', rid=item.id) }}">#{{ item.id }} {{ item.filename }}</a></td>
+        <td>{{ engine_cell(item.get('keyword')) }}</td>
+        <td>{{ engine_cell(item.get('ai')) }}</td>
+        <td class="reason">{{ (item.get('ai') or item.get('keyword') or {}).get('reason', '') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">该模板尚未运行过筛选</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ---- 模板多选：搜索 / 分组 / 收藏 / 键盘 ----
+(function () {
+  const TPL = {{ tpl_meta|tojson }};
+  const FAVS = new Set({{ favorites|tojson }});
+  const FROM_URL = {{ slugs|tojson }};
+  const RESUME_TOTAL = {{ resume_total }};
+  const RECENT_KEY = 'rt_recent_tpl';
+  const DEPT_ORDER = ["收藏", "最近使用", "人事", "电气", "业务", "IT", "未分类"];
+
+  const selected = new Set(FROM_URL.length ? FROM_URL : (TPL[0] ? [TPL[0].slug] : []));
+  let recents = [];
+  try { recents = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch (e) { recents = []; }
+
+  const box = document.getElementById('tpl-box');
+  const chips = document.getElementById('tpl-chips');
+  const search = document.getElementById('tpl-search');
+  const toggle = document.getElementById('tpl-toggle');
+  const panel = document.getElementById('tpl-panel');
+  const optionsEl = document.getElementById('tpl-options');
+  const emptyEl = document.getElementById('tpl-empty');
+  const countText = document.getElementById('tpl-count-text');
+  const hidden = document.getElementById('tpl-hidden');
+  const costEl = document.getElementById('tpl-cost');
+  if (!box || !panel) return;
+
+  let hi = -1;  // 键盘高亮索引
+
+  const bySlug = Object.fromEntries(TPL.map(t => [t.slug, t]));
+
+  function matches(t, q) {
+    if (!q) return true;
+    const hay = [t.name, t.slug, t.department, t.role, t.required, ...(t.skills || [])]
+      .join(' ').toLowerCase();
+    return hay.includes(q);
+  }
+
+  function groups(q) {
+    const out = [];
+    const fav = TPL.filter(t => FAVS.has(t.slug) && matches(t, q));
+    if (fav.length && !q) out.push({ name: '收藏', items: fav });
+    if (!q) {
+      const rec = recents.map(s => bySlug[s]).filter(t => t && !FAVS.has(t.slug) && matches(t, q));
+      if (rec.length) out.push({ name: '最近使用', items: rec });
+    }
+    const depts = [...new Set(TPL.map(t => t.department))];
+    depts.sort((a, b) => {
+      const ia = DEPT_ORDER.indexOf(a), ib = DEPT_ORDER.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    depts.forEach(d => {
+      const items = TPL.filter(t => t.department === d && matches(t, q));
+      if (items.length) out.push({ name: d, items });
+    });
+    if (q) {  // 搜索时合并为一组，避免分组头干扰
+      const hits = TPL.filter(t => matches(t, q));
+      return hits.length ? [{ name: `匹配 ${hits.length} 个`, items: hits }] : [];
+    }
+    return out;
+  }
+
+  function renderOptions() {
+    const q = search.value.trim().toLowerCase();
+    const gs = groups(q);
+    optionsEl.innerHTML = '';
+    let idx = 0;
+    gs.forEach(g => {
+      const head = document.createElement('div');
+      head.className = 'tpl-group';
+      head.textContent = g.name;
+      optionsEl.appendChild(head);
+      g.items.forEach(t => {
+        const on = selected.has(t.slug);
+        const fav = FAVS.has(t.slug);
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'tpl-opt' + (on ? ' on' : '') + (idx === hi ? ' hi' : '');
+        row.dataset.slug = t.slug;
+        row.dataset.idx = idx;
+        row.innerHTML =
+          '<span class="tpl-check"></span>' +
+          '<span class="tpl-main">' +
+            '<span class="tpl-name">' + t.name +
+              (t.role ? ' <span class="tpl-role">' + t.role + '</span>' : '') + '</span>' +
+            '<span class="tpl-sub">' + t.department + ' · 必备 ' + t.required + '</span>' +
+          '</span>' +
+          '<span class="tpl-star' + (fav ? ' on' : '') + '" data-fav="' + t.slug + '" title="收藏">★</span>';
+        row.addEventListener('click', e => {
+          if (e.target.dataset.fav) return;
+          e.stopPropagation();   // 避免重渲染后 document 的"外部点击"判断把面板关掉
+          toggleSlug(t.slug);
+        });
+        row.querySelector('[data-fav]').addEventListener('click', e => {
+          e.stopPropagation();
+          favSlug(t.slug);
+        });
+        optionsEl.appendChild(row);
+        idx++;
+      });
+    });
+    emptyEl.hidden = gs.length > 0;
+    document.querySelectorAll('.tpl-opt').forEach(el => {
+      el.addEventListener('mousemove', () => {
+        if (hi !== Number(el.dataset.idx)) {
+          hi = Number(el.dataset.idx);
+          paintHi();
+        }
+      });
+    });
+  }
+
+  function paintHi() {
+    document.querySelectorAll('.tpl-opt').forEach(el => {
+      el.classList.toggle('hi', Number(el.dataset.idx) === hi);
+    });
+    const cur = document.querySelector('.tpl-opt.hi');
+    if (cur) cur.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderChips() {
+    chips.innerHTML = '';
+    const list = [...selected].map(s => bySlug[s]).filter(Boolean);
+    list.forEach(t => {
+      const chip = document.createElement('span');
+      chip.className = 'tpl-chip';
+      chip.innerHTML = '<span>' + t.name + '</span><b title="移除">×</b>';
+      chip.querySelector('b').addEventListener('click', () => toggleSlug(t.slug));
+      chips.appendChild(chip);
+    });
+    if (!list.length) {
+      const ph = document.createElement('span');
+      ph.className = 'tpl-chip-empty';
+      ph.textContent = '尚未选择模板';
+      chips.appendChild(ph);
+    }
+    hidden.innerHTML = '';
+    list.forEach(t => {
+      const inp = document.createElement('input');
+      inp.type = 'hidden';
+      inp.name = 'templates';
+      inp.value = t.slug;
+      hidden.appendChild(inp);
+    });
+    countText.textContent = `已选 ${list.length} 个`;
+    document.dispatchEvent(new CustomEvent('tpl-change', { detail: { count: list.length } }));
+    costEl.textContent = list.length
+      ? `已选 ${list.length} 个模板 · AI 引擎约 ${list.length} × ${RESUME_TOTAL} = ${list.length * RESUME_TOTAL} 次调用（漏斗模式更少）`
+      : '至少选择一个模板';
+  }
+
+  function render() { renderChips(); renderOptions(); }
+
+  function toggleSlug(slug) {
+    if (selected.has(slug)) selected.delete(slug); else selected.add(slug);
+    render();
+  }
+
+  async function favSlug(slug) {
+    const star = document.querySelector(`[data-fav="${slug}"]`);
+    try {
+      const res = await fetch(`/templates/${slug}/favorite`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        if (data.favorite) FAVS.add(slug); else FAVS.delete(slug);
+        if (star) star.classList.toggle('on', data.favorite);
+        renderOptions();
+      }
+    } catch (e) { /* 忽略网络错误 */ }
+  }
+
+  function openPanel() {
+    panel.hidden = false;
+    box.classList.add('open');
+    hi = -1;
+    renderOptions();
+    search.focus();
+  }
+  function closePanel() {
+    panel.hidden = true;
+    box.classList.remove('open');
+  }
+
+  toggle.addEventListener('click', () => panel.hidden ? openPanel() : closePanel());
+  search.addEventListener('focus', openPanel);
+  search.addEventListener('input', () => { hi = -1; renderOptions(); });
+
+  document.addEventListener('click', e => {
+    if (!document.getElementById('tpl-select').contains(e.target)) closePanel();
+  });
+
+  search.addEventListener('keydown', e => {
+    const rows = [...document.querySelectorAll('.tpl-opt')];
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (panel.hidden) openPanel();
+      hi = Math.min(hi + 1, rows.length - 1);
+      paintHi();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      hi = Math.max(hi - 1, 0);
+      paintHi();
+    } else if (e.key === 'Enter') {
+      if (!panel.hidden && hi >= 0 && rows[hi]) {
+        e.preventDefault();
+        toggleSlug(rows[hi].dataset.slug);
+        search.value = '';
+        hi = -1;
+        renderOptions();
+      }
+    } else if (e.key === 'Escape') {
+      closePanel();
+      search.blur();
+    } else if (e.key === 'Backspace' && !search.value) {
+      const list = [...selected];
+      if (list.length) toggleSlug(list[list.length - 1]);
+    }
+  });
+
+  document.getElementById('tpl-clear').addEventListener('click', () => {
+    selected.clear();
+    render();
+  });
+  document.getElementById('tpl-select-all').addEventListener('click', () => {
+    document.querySelectorAll('.tpl-opt').forEach(el => selected.add(el.dataset.slug));
+    render();
+  });
+
+  // 提交前记录最近使用
+  const form = document.getElementById('screen-form');
+  if (form) form.addEventListener('submit', () => {
+    const merged = [...selected, ...recents.filter(s => !selected.has(s))].slice(0, 5);
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(merged)); } catch (e) { /* 忽略 */ }
+  });
+
+  render();
+})();
+</script>
+
+<script>
+// ---- 后台筛选任务：运行中轮询进度，完成后刷新一次展示结果摘要 ----
+(function () {
+  const card = document.getElementById('job-card');
+  if (!card) return;
+  const state = card.dataset.state;
+  if (state !== 'queued' && state !== 'running') return;  // 已完成/失败直接展示摘要
+
+  const fill = document.getElementById('job-fill');
+  const countEl = document.getElementById('job-count');
+  const currentEl = document.getElementById('job-current');
+  const stateEl = document.getElementById('job-state');
+  let timer = null;
+
+  async function poll() {
+    try {
+      const res = await fetch(card.dataset.url, { cache: 'no-store' });
+      if (!res.ok) return;
+      const j = await res.json();
+      fill.style.width = (j.pct || 0) + '%';
+      countEl.textContent = `${j.done} / ${j.total || '?'}`;
+      if (currentEl) currentEl.textContent = j.current || '准备中';
+      stateEl.textContent = j.state === 'running' ? `进行中 ${j.pct}%` : j.state;
+      if (j.state === 'done' || j.state === 'error' || j.state === 'missing') {
+        clearInterval(timer);
+        window.location.href = card.dataset.doneUrl;
+      }
+    } catch (e) { /* 网络抖动继续轮询 */ }
+  }
+  timer = setInterval(poll, 700);
+  poll();
+})();
+
+(function () {
+  // ---- 简历范围切换 ----
+  const picker = document.getElementById('picker');
+  const idsField = document.getElementById('ids-field');
+  const countEl = document.getElementById('pick-count');
+  const list = document.getElementById('picker-list');
+  const search = document.getElementById('picker-search');
+  const statusSel = document.getElementById('picker-status');
+
+  function scopeValue() {
+    const el = document.querySelector('input[name="scope"]:checked');
+    return el ? el.value : 'all';
+  }
+  function syncIds() {
+    const picked = [...document.querySelectorAll('.pick-item:checked')].map(i => i.value);
+    idsField.value = scopeValue() === 'selected' ? picked.join(',') : '';
+    countEl.textContent = `已选 ${picked.length} 份`;
+    document.querySelectorAll('.pick-row').forEach(row => {
+      row.classList.toggle('pick-row-on', row.querySelector('input').checked);
+    });
+  }
+  document.querySelectorAll('input[name="scope"]').forEach(r =>
+    r.addEventListener('change', () => {
+      picker.hidden = scopeValue() !== 'selected';
+      syncIds();
+      updateHint();
+    }));
+
+  // ---- 搜索 / 状态过滤（纯前端，即时） ----
+  function applyFilter() {
+    const q = search.value.trim().toLowerCase();
+    const st = statusSel.value;
+    document.querySelectorAll('.pick-row').forEach(row => {
+      const hitText = !q || row.dataset.search.includes(q);
+      const hitStatus = !st || row.dataset.status === st;
+      row.hidden = !(hitText && hitStatus);
+    });
+  }
+  search.addEventListener('input', applyFilter);
+  statusSel.addEventListener('change', applyFilter);
+
+  // ---- 全选当前可见 / 清空 ----
+  document.getElementById('pick-all').addEventListener('click', () => {
+    document.querySelectorAll('.pick-row').forEach(row => {
+      if (!row.hidden) row.querySelector('input').checked = true;
+    });
+    syncIds();
+  });
+  document.getElementById('pick-clear').addEventListener('click', () => {
+    document.querySelectorAll('.pick-item').forEach(i => { i.checked = false; });
+    syncIds();
+  });
+  list.addEventListener('change', syncIds);
+
+  // ---- 提交前提示 ----
+  const runHint = document.getElementById('run-hint');
+  function updateHint() {
+    const tpls = document.querySelectorAll('#tpl-hidden input[name="templates"]').length;
+    const engine = (document.querySelector('input[name="engine"]:checked') || {}).value;
+    if (!tpls) { runHint.textContent = '请至少勾选一个模板'; return; }
+    let text = `将执行 ${tpls} 个模板`;
+    if (engine === 'ai' || engine === 'funnel') {
+      text += ' · AI 引擎按「模板 × 简历」组合调用，注意 API 用量';
+    }
+    runHint.textContent = text;
+  }
+  document.querySelectorAll('input[name="engine"]').forEach(el =>
+    el.addEventListener('change', updateHint));
+  document.addEventListener('tpl-change', updateHint);
+  updateHint();
+  syncIds();
+})();
+</script>
+{% endblock %}

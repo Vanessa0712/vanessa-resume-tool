@@ -1,0 +1,287 @@
+{% extends "base.html" %}
+{% block title %}编辑模板{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>编辑模板 <span class="muted">{{ slug }}.json</span></h1>
+    <p class="subtitle">可视化编辑技能与权重，保存时服务端会再次校验；也可切到 JSON 源码直接改</p>
+  </div>
+  <a class="btn btn-secondary" href="{{ url_for('templates_page') }}">返回模板列表</a>
+</div>
+
+<div class="tabs" role="tablist">
+  <button class="tab active" type="button" data-tab="visual" {{ '' if raw else 'disabled' }}>可视化编辑</button>
+  <button class="tab" type="button" data-tab="json">JSON 源码</button>
+</div>
+
+<form method="post" id="tpl-form" action="{{ url_for('template_save', slug=slug) }}">
+  <!-- ============ 可视化编辑 ============ -->
+  <div class="tab-pane active" id="pane-visual">
+    {% if raw %}
+    <div class="card">
+      <div class="card-title">基本信息</div>
+      <div class="form-grid">
+        <div class="field">
+          <label>模板名称</label>
+          <input type="text" id="tpl-name" value="{{ raw.get('name', slug) }}">
+        </div>
+        <div class="field">
+          <label>最低年限（年，留空=不限）</label>
+          <input type="number" id="tpl-min-years" min="0" step="1"
+                 value="{{ raw.get('hard_gates', {}).get('min_years', '') if raw.get('hard_gates', {}).get('min_years') is not none else '' }}">
+        </div>
+        <div class="field">
+          <label>所属部门</label>
+          <input type="text" id="tpl-dept" list="dept-list"
+                 value="{{ raw.get('department', '') }}" placeholder="如 人事 / 电气 / 业务 / IT">
+          <datalist id="dept-list">
+            <option value="人事"></option><option value="电气"></option>
+            <option value="业务"></option><option value="IT"></option>
+          </datalist>
+        </div>
+        <div class="field">
+          <label>子职业方向</label>
+          <input type="text" id="tpl-role" value="{{ raw.get('role', '') }}"
+                 placeholder="如 后端开发 / 招聘 / 电气设计">
+        </div>
+        <div class="field field-check">
+          <label class="check-row">
+            <input type="checkbox" id="tpl-strict"
+                   {{ 'checked' if raw.get('hard_gates', {}).get('strict_years') }}>
+            严格年限（简历未写年限时直接判未通过）
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">必备技能 <span class="muted">（缺任一项即未通过）</span></div>
+      <div class="chip-select" id="req-chips">
+        {% set defined = (raw.get('core_skills', {}) | list) + (raw.get('nice_to_have', {}) | list) %}
+        {% set required = raw.get('hard_gates', {}).get('required_skills', []) %}
+        {% for key in defined %}
+        <label class="chip {{ 'chip-on' if key in required }}">
+          <input type="checkbox" class="req-check" value="{{ key }}" {{ 'checked' if key in required }}>
+          {{ key }}
+        </label>
+        {% endfor %}
+      </div>
+      <p class="hint">取消勾选即取消此项必备要求；新增技能标识后会自动出现在这里</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        核心技能 <span class="muted">（权重按比例折算为 90 分池，绝对值不必等于 90）</span>
+        <span class="weight-sum" id="sum-core"></span>
+      </div>
+      <div class="skill-rows" id="rows-core" data-section="core_skills">
+        {% for key, spec in raw.get('core_skills', {}).items() %}
+        <div class="skill-row">
+          <input class="skill-key" type="text" value="{{ key }}" placeholder="技能标识，如 python">
+          <input class="skill-weight" type="number" min="0" step="1" value="{{ spec.get('weight', 1) }}" placeholder="权重">
+          <input class="skill-aliases" type="text" value="{{ (spec.get('aliases') or [key]) | join(', ') }}" placeholder="别名，逗号分隔">
+          <button class="row-del" type="button" title="删除该技能">×</button>
+        </div>
+        {% endfor %}
+      </div>
+      <button class="btn btn-secondary btn-sm" type="button" data-add="rows-core">+ 添加核心技能</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        加分项 <span class="muted">（权重按比例折算为 10 分池）</span>
+        <span class="weight-sum" id="sum-nice"></span>
+      </div>
+      <div class="skill-rows" id="rows-nice" data-section="nice_to_have">
+        {% for key, spec in raw.get('nice_to_have', {}).items() %}
+        <div class="skill-row">
+          <input class="skill-key" type="text" value="{{ key }}" placeholder="技能标识，如 redis">
+          <input class="skill-weight" type="number" min="0" step="1" value="{{ spec.get('weight', 5) }}" placeholder="权重">
+          <input class="skill-aliases" type="text" value="{{ (spec.get('aliases') or [key]) | join(', ') }}" placeholder="别名，逗号分隔">
+          <button class="row-del" type="button" title="删除该技能">×</button>
+        </div>
+        {% endfor %}
+      </div>
+      <button class="btn btn-secondary btn-sm" type="button" data-add="rows-nice">+ 添加加分项</button>
+    </div>
+    {% else %}
+    <div class="card">
+      <div class="empty">当前模板 JSON 无法解析，请切到「JSON 源码」修正语法后再保存</div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ============ JSON 源码 ============ -->
+  <div class="tab-pane" id="pane-json">
+    <div class="card">
+      <textarea name="content" id="tpl-editor" class="code-editor" spellcheck="false">{{ content }}</textarea>
+      <div class="editor-error" id="editor-error" hidden></div>
+      <p class="hint">字段说明：hard_gates 必备门槛（required_skills / min_years / strict_years）· core_skills 核心技能（weight + aliases）· nice_to_have 加分项</p>
+    </div>
+  </div>
+
+  <div class="sticky-actions">
+    <button class="btn btn-primary" type="submit" id="tpl-save">校验并保存</button>
+    <span class="hint" id="save-hint">可视化模式会先转成 JSON 再提交校验</span>
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const form = document.getElementById('tpl-form');
+  const editor = document.getElementById('tpl-editor');
+  const errBox = document.getElementById('editor-error');
+  let mode = "{{ 'visual' if raw else 'json' }}";
+
+  // ---- Tab 切换 ----
+  document.querySelectorAll('.tabs .tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      if (tab.disabled) return;
+      mode = tab.dataset.tab;
+      document.querySelectorAll('.tabs .tab').forEach(t => t.classList.toggle('active', t === tab));
+      document.getElementById('pane-visual').classList.toggle('active', mode === 'visual');
+      document.getElementById('pane-json').classList.toggle('active', mode === 'json');
+      document.getElementById('save-hint').textContent = mode === 'visual'
+        ? '可视化模式会先转成 JSON 再提交校验'
+        : '直接提交 JSON 源码，服务端校验结构';
+    });
+  });
+
+  if (!document.getElementById('rows-core')) return; // JSON 无法解析时不启用可视化逻辑
+
+  // ---- 技能行：新增 / 删除 ----
+  function addRow(containerId) {
+    const box = document.getElementById(containerId);
+    const row = document.createElement('div');
+    row.className = 'skill-row';
+    row.innerHTML = '<input class="skill-key" type="text" placeholder="技能标识">'
+      + '<input class="skill-weight" type="number" min="0" step="1" placeholder="权重">'
+      + '<input class="skill-aliases" type="text" placeholder="别名，逗号分隔">'
+      + '<button class="row-del" type="button" title="删除">×</button>';
+    box.appendChild(row);
+    row.querySelector('.skill-key').focus();
+    bindRow(row);
+  }
+  document.querySelectorAll('[data-add]').forEach(b =>
+    b.addEventListener('click', () => addRow(b.dataset.add)));
+
+  function bindRow(row) {
+    row.querySelector('.row-del').addEventListener('click', () => {
+      row.remove(); refreshChips(); updateSums();
+    });
+    row.querySelectorAll('input').forEach(inp => {
+      inp.addEventListener('input', () => { refreshChips(); updateSums(); });
+    });
+  }
+  document.querySelectorAll('.skill-row').forEach(bindRow);
+
+  // ---- 必备技能 chips 与技能标识保持同步 ----
+  const reqBox = document.getElementById('req-chips');
+  const checked = new Set([...reqBox.querySelectorAll('.req-check:checked')].map(c => c.value));
+
+  function currentKeys() {
+    const keys = [];
+    document.querySelectorAll('.skill-rows .skill-key').forEach(inp => {
+      const v = inp.value.trim();
+      if (v && !keys.includes(v)) keys.push(v);
+    });
+    return keys;
+  }
+  function refreshChips() {
+    const keys = currentKeys();
+    [...reqBox.querySelectorAll('.chip')].forEach(chip => {
+      const val = chip.querySelector('input').value;
+      if (!keys.includes(val)) chip.remove();
+    });
+    const existing = [...reqBox.querySelectorAll('.chip input')].map(i => i.value);
+    keys.forEach(k => {
+      if (existing.includes(k)) return;
+      const label = document.createElement('label');
+      label.className = 'chip';
+      label.innerHTML = `<input type="checkbox" class="req-check" value="${k}"> ${k}`;
+      label.querySelector('input').addEventListener('change', e => {
+        if (e.target.checked) checked.add(k); else checked.delete(k);
+        label.classList.toggle('chip-on', e.target.checked);
+      });
+      reqBox.appendChild(label);
+    });
+    reqBox.querySelectorAll('.chip').forEach(chip => {
+      const inp = chip.querySelector('input');
+      chip.classList.toggle('chip-on', inp.checked);
+    });
+  }
+  reqBox.querySelectorAll('.chip input').forEach(inp =>
+    inp.addEventListener('change', e => {
+      if (e.target.checked) checked.add(e.target.value); else checked.delete(e.target.value);
+      e.target.closest('.chip').classList.toggle('chip-on', e.target.checked);
+    }));
+
+  // ---- 权重合计提示 ----
+  function updateSums() {
+    const sum = box => [...document.querySelectorAll(`#${box} .skill-weight`)]
+      .reduce((a, i) => a + (parseFloat(i.value) || 0), 0);
+    const core = sum('rows-core'), nice = sum('rows-nice');
+    const c = document.getElementById('sum-core');
+    const n = document.getElementById('sum-nice');
+    c.textContent = core > 0 ? `当前合计 ${core}` : '尚未设置权重';
+    c.className = 'weight-sum ' + (core > 0 ? 'ok' : 'warn');
+    n.textContent = nice > 0 ? `当前合计 ${nice}` : '可选，未设置则不加分';
+    n.className = 'weight-sum ' + (nice > 0 ? 'ok' : 'muted');
+  }
+  document.querySelectorAll('.skill-weight').forEach(i =>
+    i.addEventListener('input', updateSums));
+  updateSums();
+
+  // ---- 提交：可视化模式序列化为 JSON ----
+  form.addEventListener('submit', e => {
+    if (mode === 'visual') {
+      const collect = boxId => {
+        const out = {};
+        document.querySelectorAll(`#${boxId} .skill-row`).forEach(row => {
+          const key = row.querySelector('.skill-key').value.trim();
+          if (!key) return;
+          const aliases = row.querySelector('.skill-aliases').value
+            .split(/[,，;；\s]+/).map(s => s.trim()).filter(Boolean);
+          out[key] = {
+            weight: parseFloat(row.querySelector('.skill-weight').value) || 1,
+            aliases: aliases.length ? aliases : [key]
+          };
+        });
+        return out;
+      };
+      const minRaw = document.getElementById('tpl-min-years').value.trim();
+      const data = {
+        name: document.getElementById('tpl-name').value.trim() || {{ slug|tojson }},
+        department: document.getElementById('tpl-dept').value.trim(),
+        role: document.getElementById('tpl-role').value.trim(),
+        hard_gates: {
+          required_skills: [...document.querySelectorAll('.req-check')].filter(c => c.checked).map(c => c.value),
+          min_years: minRaw === '' ? null : parseInt(minRaw, 10),
+          strict_years: document.getElementById('tpl-strict').checked
+        },
+        core_skills: collect('rows-core'),
+        nice_to_have: collect('rows-nice')
+      };
+      if (!Object.keys(data.core_skills).length) {
+        e.preventDefault();
+        errBox.hidden = false;
+        errBox.textContent = '核心技能不能为空，请至少添加一项';
+        return;
+      }
+      editor.value = JSON.stringify(data, null, 2);
+    }
+    try {
+      JSON.parse(editor.value);
+      errBox.hidden = true;
+    } catch (err) {
+      e.preventDefault();
+      errBox.hidden = false;
+      errBox.textContent = 'JSON 语法错误：' + err.message;
+      document.querySelector('.tab[data-tab="json"]').click();
+    }
+  });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,10 @@
+张三 — Python 后端开发工程师
+
+工作年限：6年后端开发经验
+
+技能：精通 Python / Python3，asyncio 异步编程与 async/await；
+FastAPI + uvicorn 高并发服务；MySQL / PostgreSQL 复杂 SQL 调优；
+Docker / Kubernetes 容器化，GitLab CI/CD，pytest 单元测试。
+
+项目：交易平台 FastAPI 重构 QPS 800→3000；PostgreSQL 分库分表；
+Python 异步管道对接 Kafka，Redis 缓存命中率 92%，AWS 部署。

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}AI 设置{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>AI 设置</h1>
+    <p class="subtitle">所有兼容 OpenAI chat/completions 协议的服务均可接入，含自建网关；Key 仅保存于本机配置文件</p>
+  </div>
+</div>
+
+<p class="dataflow-note">
+  <b>数据流向：</b>关键词引擎全程在本机完成，简历不出本机；启用 AI 引擎或漏斗的复核阶段时，
+  简历正文与模板内容会发送至所选厂商的接口，仅用于本次打分。
+</p>
+
+<form method="post">
+  {% for name, spec in providers.get('providers', {}).items() %}
+  <div class="card provider-card">
+    <div class="provider-head">
+      <label class="provider-radio">
+        <input type="radio" name="active" value="{{ name }}"
+               {{ 'checked' if providers.get('active') == name }}>
+        <span class="provider-name">{{ spec.get('label', name) }}</span>
+        <span class="provider-slug">{{ name }}</span>
+      </label>
+      {% if spec.get('api_key') and spec.get('base_url') and spec.get('model') %}
+        <span class="badge badge-pass">已就绪</span>
+      {% else %}
+        <span class="badge badge-review">缺配置</span>
+      {% endif %}
+    </div>
+    <div class="provider-grid">
+      <div class="field"><label>显示名称</label>
+        <input type="text" name="{{ name }}__label" value="{{ spec.get('label', '') }}"></div>
+      <div class="field"><label>Base URL</label>
+        <input type="text" name="{{ name }}__base_url" value="{{ spec.get('base_url', '') }}"
+               placeholder="https://your-api.example.com/v1"></div>
+      <div class="field"><label>API Key<span class="muted">（留空表示不修改）</span></label>
+        <input type="password" name="{{ name }}__api_key" placeholder="{{ '已保存，输入新值可替换' if spec.get('api_key') else 'sk-...' }}"
+               autocomplete="off"></div>
+      <div class="field"><label>模型</label>
+        <input type="text" name="{{ name }}__model" value="{{ spec.get('model', '') }}"
+               placeholder="例如 deepseek-chat"></div>
+    </div>
+  </div>
+  {% endfor %}
+  <button class="btn btn-primary btn-lg" type="submit">保存配置</button>
+  <p class="hint">选中单选框的厂商即为「当前使用」；未配置 Key 时 AI 引擎与漏斗的复核阶段会自动降级为人工提示。</p>
+</form>
+
+<div class="card">
+  <div class="card-title">原文件打开方式</div>
+  <form method="post" action="{{ url_for('settings_preview') }}">
+    <div class="form-grid">
+      <div class="field">
+        <label>默认打开方式</label>
+        <select name="preview_method">
+          {% for key, label in open_methods.items() %}
+          <option value="{{ key }}" {{ 'selected' if key == app_settings.preview_method }}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label>云文档地址</label>
+        <input type="text" name="cloud_url" value="{{ app_settings.cloud_url }}"
+               placeholder="https://docs.qq.com/desktop">
+      </div>
+    </div>
+    <p class="hint">「用此方式打开」按钮会以本机程序打开简历原文件；云文档方式仅复制文件路径并打开该网址，不会自动上传</p>
+    <button class="btn btn-primary" type="submit">保存打开方式</button>
+  </form>
+</div>
+{% endblock %}

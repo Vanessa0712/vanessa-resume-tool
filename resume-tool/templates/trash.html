@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}回收站{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>回收站</h1>
+    <p class="subtitle">删除的简历先进入这里，可随时恢复；彻底删除后筛选记录一并清除（磁盘原文件保留）</p>
+  </div>
+  <div class="head-actions">
+    {% if rows %}
+    <form method="post" action="{{ url_for('trash_empty') }}"
+          onsubmit="return confirm('确认清空回收站？将彻底删除 {{ rows|length }} 份简历及其筛选记录，不可恢复。')">
+      <button class="btn btn-danger" type="submit">清空回收站</button>
+    </form>
+    {% endif %}
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">已删除简历 <span class="muted">（{{ rows|length }} 份）</span></div>
+  {% if rows %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr><th>ID</th><th>文件名</th><th>字符数</th><th>导入时间</th><th>删除时间</th><th class="th-actions">操作</th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td class="muted">#{{ r.id }}</td>
+          <td><a class="link" href="{{ url_for('resume_detail', rid=r.id) }}">{{ r.filename }}</a></td>
+          <td class="muted">{{ r.chars }}</td>
+          <td class="muted">{{ r.imported_at.replace('T', ' ') }}</td>
+          <td class="muted">{{ r.deleted_at.replace('T', ' ') }}</td>
+          <td class="td-actions">
+            <form method="post" action="{{ url_for('trash_restore', rid=r.id) }}" class="inline">
+              <button class="btn btn-xs" type="submit">恢复</button>
+            </form>
+            <form method="post" action="{{ url_for('trash_purge', rid=r.id) }}" class="inline"
+                  onsubmit="return confirm('彻底删除「{{ r.filename }}」及其筛选记录？此操作不可恢复。')">
+              <button class="btn btn-xs btn-danger-ghost" type="submit">彻底删除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">回收站是空的</div>
+  {% endif %}
+</div>
+{% endblock %}

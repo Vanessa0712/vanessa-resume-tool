@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge, engine_cell %}
+{% block title %}候选人版本{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ p.name or '(未识别姓名)' }}</h1>
+    <p class="subtitle">
+      {% if p.phone %}手机 {{ p.phone }} · {% endif %}
+      {% if p.email %}邮箱 {{ p.email }} · {% endif %}
+      共 {{ versions|length }} 个版本（在库 {{ alive }} 个）
+    </p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('export_xlsx', ids=versions|map(attribute='id')|join(',')) }}">导出该候选人 xlsx</a>
+    <a class="btn btn-secondary" href="{{ url_for('persons') }}">返回候选人</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <div class="card-title">简历版本 <span class="muted">（按导入时间倒序）</span></div>
+    <span class="muted small">同一人的多份简历会被归并到这里，便于对比新旧版本</span>
+  </div>
+  {% if versions %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr><th>ID</th><th>文件名</th><th>字符数</th><th>关键词结果</th><th>AI 结果</th>
+            <th>导入时间</th><th>库内状态</th><th class="th-actions">操作</th></tr>
+      </thead>
+      <tbody>
+        {% for v in versions %}
+        <tr class="{{ 'row-dim' if v.deleted_at }}">
+          <td class="muted">#{{ v.id }}</td>
+          <td>
+            <a class="link" href="{{ url_for('resume_detail', rid=v.id) }}">{{ v.filename }}</a>
+            {% if loop.first %}<span class="ver-chip ver-chip-new">最新</span>{% endif %}
+          </td>
+          <td class="muted">{{ v.chars }}</td>
+          <td>{{ engine_cell(v.keyword) }}</td>
+          <td>{{ engine_cell(v.ai) }}</td>
+          <td class="muted">{{ v.imported_at.replace('T', ' ') }}</td>
+          <td>
+            {% if v.deleted_at %}<span class="badge badge-none">回收站</span>
+            {% else %}<span class="badge badge-pass">在库</span>{% endif %}
+          </td>
+          <td class="td-actions">
+            <a class="btn btn-xs" href="{{ url_for('resume_detail', rid=v.id) }}">详情</a>
+            {% if not v.deleted_at %}
+            <button class="btn btn-xs btn-danger-ghost" type="submit" form="del-{{ v.id }}"
+                    onclick="return confirm('将「{{ v.filename }}」移入回收站？')">删除</button>
+            <form method="post" id="del-{{ v.id }}" action="{{ url_for('resume_delete', rid=v.id) }}"></form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">该候选人暂无简历</div>
+  {% endif %}
+</div>
+{% endblock %}
