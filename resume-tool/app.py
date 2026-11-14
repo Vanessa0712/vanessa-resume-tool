@@ -6,7 +6,7 @@
   /resume/<id>     简历详情（抽取文本 + 筛选历史）
   /screen          筛选中心（模板/引擎选择 + 结果排名）
   /templates       模板管理（列表 + JSON 编辑器）
-  /settings        AI 厂商配置（多厂商，OpenAI 兼容协议）
+  /settings        综合设置（通用选项 + AI 厂商 + 版本更新检查）
 
 启动：python app.py  →  http://127.0.0.1:5000
 """
@@ -21,6 +21,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from datetime import date, datetime
@@ -39,6 +41,7 @@ DB = str(BASE / "resume_tool.db")
 TPL_DIR = BASE / "config" / "templates"
 PROVIDERS_PATH = BASE / "config" / "providers.json"
 APP_SETTINGS_PATH = BASE / "config" / "app_settings.json"
+UPDATE_MANIFEST_PATH = BASE / "update-manifest.json"
 UPLOAD_DIR = BASE / "uploads"
 
 app = Flask(__name__)
@@ -47,6 +50,18 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True  # UI 迭代期模板改动即时生�
 
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
+    {
+        "version": "ver1.2.0",
+        "channel": "Beta",
+        "date": "2026-11-14",
+        "title": "综合设置与 WorkBuddy Agent 协作筛选",
+        "entries": [
+            "侧边栏「AI 设置」升级为综合「设置」，集中管理通用选项、AI 厂商与版本更新",
+            "设置页新增「检查更新」：读取版本 manifest，比对版本并展示更新说明与安装包下载地址",
+            "新增 Agent 协作筛选接口：导出脱敏批次给 WorkBuddy Agent 评估，再写回结果库，无需 API Key",
+            "配套 resume-tool-agent 技能可一键驱动完整筛选流程，评估额度记在使用者自己的 WorkBuddy 账号",
+        ],
+    },
     {
         "version": "ver1.1.1",
         "channel": "Beta",
@@ -217,7 +232,12 @@ def provider_status() -> tuple[dict, dict | None]:
 
 
 def load_app_settings() -> dict:
-    defaults = {"preview_method": "default", "cloud_url": "https://docs.qq.com/desktop"}
+    defaults = {
+        "preview_method": "default",
+        "cloud_url": "https://docs.qq.com/desktop",
+        "update_url": "",  # 留空读取项目根 update-manifest.json；分发时填固定 HTTPS 地址
+        "auto_check_updates": True,
+    }
     if APP_SETTINGS_PATH.is_file():
         try:
             defaults.update(json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8")))
@@ -229,6 +249,64 @@ def load_app_settings() -> dict:
 def save_app_settings(data: dict) -> None:
     APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     APP_SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---------- 版本更新（manifest 驱动） ----------
+
+def current_version() -> str:
+    return CHANGELOG[0]["version"] if CHANGELOG else "ver0.0.0"
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    """ver1.2.0 / 1.2 / v2 统一转数字元组，用于递增比较."""
+    nums = [int(n) for n in re.findall(r"\d+", version or "")[:4]]
+    return tuple((nums + [0, 0, 0, 0])[:4])
+
+
+def _read_update_manifest(source: str) -> tuple[dict, str]:
+    """读取更新 manifest；支持 HTTPS/HTTP、本地路径，空值走项目根默认文件."""
+    source = (source or "").strip()
+    if not source:
+        path = UPDATE_MANIFEST_PATH
+        if not path.is_file():
+            raise ValueError("未配置更新地址，且项目根目录没有 update-manifest.json")
+        return json.loads(path.read_text(encoding="utf-8")), "本地更新清单"
+    if source.startswith(("https://", "http://")):
+        req = urllib.request.Request(
+            source, headers={"User-Agent": f"ResumeTool/{current_version()}"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read(1_000_000).decode("utf-8")  # 限制 1MB，避免异常响应占内存
+        return json.loads(raw), source
+    path = Path(source[7:] if source.startswith("file://") else source)
+    if not path.is_absolute():
+        path = BASE / path
+    return json.loads(path.read_text(encoding="utf-8")), str(path)
+
+
+def check_for_update() -> dict:
+    """拉取并比较版本；所有异常转为设置页可展示的结果，不让检查失败影响其他设置."""
+    current = current_version()
+    base = {"current_version": current, "checked_at": datetime.now().isoformat(timespec="seconds")}
+    try:
+        manifest, source = _read_update_manifest(load_app_settings().get("update_url", ""))
+        latest = str(manifest.get("version", "")).strip()
+        if not latest or not re.search(r"\d", latest):
+            raise ValueError("更新清单缺少有效的 version 字段")
+        notes = manifest.get("notes", [])
+        return {
+            **base,
+            "ok": True,
+            "latest_version": latest,
+            "update_available": version_tuple(latest) > version_tuple(current),
+            "title": str(manifest.get("title", "")),
+            "date": str(manifest.get("date", "")),
+            "notes": [str(n) for n in notes][:12] if isinstance(notes, list) else [],
+            "download_url": str(manifest.get("download_url", "")),
+            "source": source,
+        }
+    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        return {**base, "ok": False, "error": f"检查失败：{exc}"}
 
 
 @app.context_processor
@@ -1331,13 +1409,19 @@ def template_favorite(slug: str):
     return {"ok": True, "slug": slug, "favorite": on, "favorites": get_favorites()}
 
 
-# ---------- 路由：AI 设置 ----------
+# ---------- 路由：综合设置 ----------
 
 @app.get("/settings")
 def settings():
     providers, active = provider_status()
     return render_template("settings.html", providers=providers,
-                           active_provider=active, active="settings")
+                           active_provider=active, current_version=current_version(),
+                           active="settings")
+
+
+@app.get("/settings/check-update")
+def settings_check_update():
+    return check_for_update()
 
 
 @app.post("/settings")
@@ -1361,8 +1445,10 @@ def settings_preview():
     method = request.form.get("preview_method", "default")
     cfg["preview_method"] = method if method in OPEN_METHODS else "default"
     cfg["cloud_url"] = request.form.get("cloud_url", cfg.get("cloud_url", "")).strip()
+    cfg["update_url"] = request.form.get("update_url", cfg.get("update_url", "")).strip()
+    cfg["auto_check_updates"] = request.form.get("auto_check_updates") == "on"
     save_app_settings(cfg)
-    flash("默认打开方式已保存")
+    flash("通用设置已保存")
     return redirect(url_for("settings"))
 
 

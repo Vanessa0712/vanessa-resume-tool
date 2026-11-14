@@ -21,8 +21,34 @@ python resume_tool.py export --out report.csv              # 导出报告
 | `keyword` | 引擎A：本地关键词加权评分，完全离线 | 零 |
 | `ai` | 引擎B：逐份调用大模型语义评估 | 按次计费 |
 | `funnel`（推荐） | 关键词全量初筛 → AI 只复核「待核实」名单 | 成本可控 |
+| `agent`（免Key） | WorkBuddy Agent 协作评估（见下节） | 消耗使用者自己 WorkBuddy 账号额度 |
 
 引擎A评分模型：硬性门槛（必备技能/年限）一票否决 + 核心技能加权评分（证据次数 0-5 分映射，核心占 90 分池 + 加分项 10 分池），与 `resume-screener` 同一套已验证逻辑。
+
+## Agent 协作模式（免 API Key，2026-11-14 新增）
+
+适合分发给办公人员 + 无自备 Key 的场景：**AI 评估发生在使用者自己的 WorkBuddy 会话里，额度消耗记在本人账号**，本工具全程不接触任何密钥。
+
+```bash
+# 1) keyword 初筛（或直接 --all 全量导出）
+python resume_tool.py screen --engine keyword --template config/template.json
+
+# 2) 导出「待核实」批次（文本已脱敏：姓名/手机/邮箱打码）
+python resume_tool.py agent-export --template config/template.json --out agent-batch.json
+
+# 3) 在 WorkBuddy 里对 Agent 说：读 agent-batch.json，按其中 instructions
+#    逐份评估，把结果 JSON 数组写入 agent-results.json
+
+# 4) 写回简历库（engine 记为 ai，detail 含 provider=workbuddy-agent 溯源）
+python resume_tool.py agent-import --in agent-results.json --template config/template.json
+```
+
+- 批次文件自带评估说明、筛选标准与输出 JSON 格式（与引擎B输出同构），Agent 照做即可
+- 结果写回后 Web UI 报告页 / CSV / xlsx 导出**零改动**即可显示
+- `agent-export --all` 全量导出、`--ids 1,3,5` 指定导出；默认只导 keyword 初筛为「待核实」的名单（即 funnel 第 2 阶段的人工替代）
+- 该模式与云服务无关：无需发布、无需 Origin 校验，天然适配未来 exe 打包路线
+- 隐私提示：脱敏只覆盖姓名/手机/邮箱三类，工作经历等其余内容仍会进入会话上下文
+- **配套 Skill**：`dist/resume-tool-agent.zip` —— 安装到办公人员的 WorkBuddy（用户级技能）后，一句「帮我筛选简历」即可触发全流程；源码见 `~/.workbuddy/skills/resume-tool-agent/SKILL.md`
 
 ## 格式支持（doc/pdf 为主，按你的确认项实现）
 
@@ -55,6 +81,30 @@ python resume_tool.py export --out report.csv              # 导出报告
 - Key 只存本地 JSON，**不进代码库、不打包进 exe**（沿用可行性报告的安全要求）
 - base_url/model 以各厂商官方文档为准
 
+## 版本更新与分发（manifest 驱动）
+
+客户端「设置 → 版本更新」会读取更新清单并比较版本，发现新版本后展示更新说明与下载按钮。当前为**检查 + 下载**的半自动更新，不会静默覆盖安装。
+
+维护者推送一次更新的步骤：
+
+1. 在 `app.py` 的 `CHANGELOG` 顶部添加新版本记录（第一条就是客户端当前版本）
+2. 将新安装包（源码 zip / 后续 exe）上传到固定 HTTPS 地址
+3. 修改并上传 `update-manifest.json` 到同一个固定地址：
+
+```json
+{
+  "version": "ver1.3.0",
+  "date": "2026-11-20",
+  "title": "新版本标题",
+  "notes": ["更新内容一", "更新内容二"],
+  "download_url": "https://your-server.example.com/resume-tool/resume-tool-ver1.3.0.zip"
+}
+```
+
+4. 各办公人员在「设置」里填写该清单地址（只需一次），之后自动或手动检查更新
+
+未配置地址时读取项目根的 `update-manifest.json`，便于本地验证。升级前备份 `resume_tool.db` 与 `config/`；后续 exe 数据目录外移后，安装包更新不覆盖简历数据。
+
 ## 筛选模板
 
 `config/template.json`：`hard_gates`（必备技能 + 最低年限）+ `core_skills`（权重 + 别名）+ `nice_to_have`。换岗位 = 复制一份改技能表，`--template` 指定即可。多模板可并存。
@@ -65,6 +115,7 @@ python resume_tool.py export --out report.csv              # 导出报告
 - 关键词引擎：91.7 分资深后端通过、0 分缺必备技能未通过，门槛与评分逻辑正确
 - AI 未配置时给出可操作指引（不崩溃）；funnel 在 AI 缺失时自动降级为"人工复核提示"
 - 重复导入按内容哈希 100% 去重；CSV 导出 utf-8-sig（Excel 直开不乱码）
+- **Agent 协作模式全链路（2026-11-14）**：8 份简历 keyword 初筛 → agent-export（PII 打码生效）→ Agent 会话内评估 → agent-import 写回 8 条（engine=ai + provider 溯源）→ Web UI /screen 与 CSV 报告均正确显示
 
 ## Web UI（Beta ver1.0.1）
 
@@ -83,7 +134,7 @@ python app.py        # → http://127.0.0.1:5000
 | 简历详情 `/resume/<id>` | 解析文本预览 → 筛选历史（每页 10 条，底部翻页 + 页码跳转）→ 原文件预览（PDF/文本内嵌，doc/docx 引导本机打开）、打开方式可选：系统默认 / WPS / Word / 资源管理器定位 / 云文档（复制路径 + 打开网盘） |
 | 导出 | `GET /export-xlsx`：候选人报告（14 列，表头冻结 + 自动筛选 + 汇总页，支持 q/template/ids 过滤）；`/export` 导出 CSV |
 | 更新日志 `/changelog` | 侧边栏入口（未读显示 NEW），历史公告按版本卡片展示，可展开/收起 |
-| AI 设置 `/settings` | 多厂商 Key/BaseURL/模型配置（留空不覆盖已存 Key）、默认打开方式与云文档地址 |
+| 设置 `/settings` | 版本更新检查（manifest 比对 + 更新说明 + 下载入口）、通用设置（打开方式/云文档/更新地址/自动检查）、多厂商 Key/BaseURL/模型配置（留空不覆盖已存 Key） |
 
 其他：
 

@@ -7,6 +7,8 @@
   A. keyword  本地关键词加权评分——离线、秒级、零成本（复用已验证的筛选模型）
   B. ai       OpenAI 兼容协议调用大模型 API——语义理解，多家可切换可自定义
   funnel      分级漏斗：keyword 全量初筛 → ai 只复核「待核实」名单（推荐，控成本）
+  agent       WorkBuddy Agent 协作：本工具导出脱敏批次 → Agent 在会话内评估
+              （消耗使用者自己 WorkBuddy 账号的额度，无需 API Key）→ 结果写回本库
 
 简历库：SQLite 单文件（标准库 sqlite3）
 格式支持：.txt/.md/.docx/.doc/.pdf
@@ -21,6 +23,9 @@
   python resume_tool.py screen  --engine funnel   --template config/template.json
   python resume_tool.py export  --out report.csv
   python resume_tool.py providers
+  python resume_tool.py agent-export --template config/template.json          # 导出脱敏批次
+  python resume_tool.py agent-import --template config/template.json \
+                                    --in agent-results.json                  # 写回评估结果
 """
 
 from __future__ import annotations
@@ -407,14 +412,19 @@ def call_llm(provider: dict, user_prompt: str, timeout_s: int = 90) -> str:
         raise RuntimeError(f"请求/解析失败: {exc}") from exc
 
 
-def screen_ai(provider: dict, tpl: Template, text: str) -> dict:
-    """引擎B：单份简历 AI 评估。返回与引擎A同构的结果."""
-    criteria = {
+def _template_criteria(tpl: Template) -> dict:
+    """筛选模板 → 供 AI/Agent 读取的标准描述（screen_ai 与 agent-export 共用）."""
+    return {
         "必备门槛(required_skills)": list(tpl.required_skills),
         "最低年限(min_years)": tpl.min_years,
         "核心技能与权重": {r.name: r.weight for r in tpl.core_skills},
         "加分项": {r.name: r.weight for r in tpl.nice_to_have} or None,
     }
+
+
+def screen_ai(provider: dict, tpl: Template, text: str) -> dict:
+    """引擎B：单份简历 AI 评估。返回与引擎A同构的结果."""
+    criteria = _template_criteria(tpl)
     user_prompt = (
         f"筛选标准：\n{json.dumps(criteria, ensure_ascii=False, indent=2)}\n\n"
         f"简历全文（超长截断）：\n{text[:6000]}"
@@ -428,6 +438,103 @@ def screen_ai(provider: dict, tpl: Template, text: str) -> dict:
         "reason": str(result.get("reason", ""))[:200],
         "missing": list(result.get("missing", []) or []),
     }
+
+
+# ============ 引擎C：WorkBuddy Agent 协作（免 API Key） ============
+#
+# 链路：agent-export 导出「待核实」批次（文本已脱敏）→ 使用者在 WorkBuddy 会话里
+# 让 Agent 逐份评估（消耗其本人账号额度）→ agent-import 把结果 JSON 写回 screenings
+# 表（engine 记为 "ai"，detail 内含 provider 标记），Web UI 报告零改动即可显示。
+
+AGENT_INSTRUCTIONS = (
+    "你是简历初筛助手（WorkBuddy Agent 协作模式）。请逐份评估本批次中的简历。\n"
+    '每份简历输出一个 JSON 对象：{"resume_id": 简历ID整数, "passed": true/false, '
+    '"score": 0-100整数, "missing": ["缺失的必备项"], "reason": "50字内的中文判断理由"}\n'
+    "评分口径：满足全部必备门槛且核心技能证据充分 80+；部分匹配 50-79；明显不符 <50。\n"
+    "把所有结果放入一个 JSON 数组（元素顺序不限），写入结果文件后由 agent-import 导回。\n"
+    "注意：简历文本已脱敏（姓名/手机/邮箱打码），按技能证据与年限表述正常评估即可。"
+)
+
+
+def mask_pii(text: str, name: str | None) -> str:
+    """Agent 批次导出前脱敏：打码手机/邮箱/姓名，降低进入对话上下文的隐私面."""
+    out = _PHONE_RE.sub("[手机已打码]", text or "")
+    out = _EMAIL_RE.sub("[邮箱已打码]", out)
+    if name and len(name) >= 2:
+        out = out.replace(name, "[姓名已打码]")
+    return out
+
+
+def _latest_keyword_screenings(conn: sqlite3.Connection, tpl_name: str) -> dict[int, sqlite3.Row]:
+    """每份简历在该模板下最新一次 keyword 结果（用于挑选「待核实」名单）."""
+    latest: dict[int, sqlite3.Row] = {}
+    for s in conn.execute(
+        "SELECT * FROM screenings WHERE engine='keyword' AND template=?"
+        " ORDER BY created_at, id", (tpl_name,)
+    ).fetchall():
+        latest[int(s["resume_id"])] = s
+    return latest
+
+
+def agent_export_batch(conn: sqlite3.Connection, tpl: Template, resumes: list) -> dict:
+    """构造给 Agent 的批次 JSON（文本脱敏）。CLI 与 Web UI 共用."""
+    items = []
+    for row in resumes:
+        _, name, _, _ = person_info(row["filename"], row["text"])
+        items.append({
+            "resume_id": int(row["id"]),
+            "filename": row["filename"],
+            "text": mask_pii(row["text"], name),
+        })
+    return {
+        "tool": "resume-tool",
+        "batch_version": 1,
+        "template": tpl.name,
+        "generated_at": now(),
+        "resume_count": len(items),
+        "instructions": AGENT_INSTRUCTIONS,
+        "criteria": _template_criteria(tpl),
+        "resumes": items,
+    }
+
+
+def agent_import_results(conn: sqlite3.Connection, tpl_name: str,
+                         results: list, engine: str = "ai") -> tuple[int, int]:
+    """校验并写回 Agent 结果列表。返回 (成功数, 跳过数)。CLI 与 Web UI 共用.
+
+    结果元素格式：{"resume_id", "passed", "score", "missing", "reason"}（与引擎B输出同构），
+    写入 screenings 时 detail 额外携带 provider 标记以便溯源。
+    """
+    ok = fail = 0
+    for item in results:
+        try:
+            rid = int(item["resume_id"])
+            row = conn.execute(
+                "SELECT id, filename FROM resumes WHERE id=? AND deleted_at IS NULL", (rid,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"简历 ID {rid} 不存在或已在回收站")
+            if "passed" not in item:
+                raise KeyError("缺少 passed 字段")
+            score = float(item.get("score", 0))
+            if not 0 <= score <= 100:
+                raise ValueError("score 应在 0-100 之间")
+            result = {
+                "score": round(score, 1),
+                "status": "通过" if item.get("passed") else "未通过",
+                "reason": str(item.get("reason", ""))[:200],
+                "missing": [str(m) for m in (item.get("missing") or [])][:20],
+                "provider": "workbuddy-agent",
+            }
+        except (KeyError, ValueError, TypeError) as exc:
+            print(f"  [跳过] 第 {fail + ok + 1} 条: {exc}", file=sys.stderr)
+            fail += 1
+            continue
+        _save_screening(conn, rid, engine, tpl_name, result)
+        print(f"  #{rid:<4} {result['status']:<4} {result['score']:<7}"
+              f"{row['filename']}  ({result['reason']})")
+        ok += 1
+    return ok, fail
 
 
 # ============ 存储（SQLite） ============
@@ -938,6 +1045,58 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_export(args: argparse.Namespace) -> int:
+    """导出待评估批次给 WorkBuddy Agent（文本脱敏）."""
+    tpl = load_template(Path(args.template))
+    conn = get_conn(args.db)
+
+    if args.ids:
+        resumes = _fetch_resumes(conn, args.ids)
+    elif args.all:
+        resumes = _fetch_resumes(conn)
+    else:
+        latest = _latest_keyword_screenings(conn, tpl.name)
+        review_ids = [rid for rid, s in latest.items() if s["status"] == "待核实"]
+        if not review_ids:
+            sys.exit(
+                "[提示] 当前没有 keyword 初筛为「待核实」的简历。\n"
+                "先执行 screen --engine keyword（或 funnel）刷新初筛；"
+                "或用 --all 导出全量、--ids 指定 ID。"
+            )
+        resumes = _fetch_resumes(conn, review_ids)
+    if not resumes:
+        sys.exit("[错误] 选中的简历不存在或已在回收站")
+
+    batch = agent_export_batch(conn, tpl, resumes)
+    out = Path(args.out)
+    out.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[导出完成] {batch['resume_count']} 份待评估简历（已脱敏） → {out.resolve()}")
+    print(f"模板「{tpl.name}」 | 下一步：让 WorkBuddy Agent 按批次内 instructions 评估，"
+          f"结果存为 JSON 数组后执行 agent-import --in <结果文件>")
+    return 0
+
+
+def cmd_agent_import(args: argparse.Namespace) -> int:
+    """把 Agent 评估结果 JSON 写回简历库（engine 记为 ai，可溯源 provider）."""
+    path = Path(args.in_file)
+    if not path.is_file():
+        sys.exit(f"[参数错误] 找不到结果文件: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        sys.exit(f"[参数错误] 结果文件 JSON 解析失败: {exc}")
+    if isinstance(raw, dict):
+        raw = raw.get("results", [])
+    if not isinstance(raw, list) or not raw:
+        sys.exit("[参数错误] 结果文件应为 JSON 数组（或含 results 数组的对象）且不能为空")
+
+    tpl = load_template(Path(args.template))
+    conn = get_conn(args.db)
+    ok, fail = agent_import_results(conn, tpl.name, raw)
+    print(f"[导入完成] 写回 {ok} 条，跳过 {fail} 条（模板「{tpl.name}」，Web UI 报告页可直接查看）")
+    return 0 if ok else 1
+
+
 # ============ CLI ============
 
 def main(argv: list[str] | None = None) -> int:
@@ -965,12 +1124,27 @@ def main(argv: list[str] | None = None) -> int:
     p_search = sub.add_parser("search", help="全文搜索简历正文（中文按字切分 + FTS5）")
     p_search.add_argument("--q", required=True, help="关键词，多个词用空格分隔（AND 关系）")
 
+    p_agent_export = sub.add_parser(
+        "agent-export", help="导出待评估批次给 WorkBuddy Agent（文本已脱敏，无需 API Key）")
+    p_agent_export.add_argument("--template", required=True, help="筛选模板 JSON 路径")
+    p_agent_export.add_argument("--out", default="agent-batch.json",
+                                help="批次输出路径（默认 agent-batch.json）")
+    p_agent_export.add_argument("--all", action="store_true",
+                                help="导出全部简历（默认只导 keyword 初筛为「待核实」的）")
+    p_agent_export.add_argument("--ids", default=None, help="只导出指定 ID，逗号分隔，如 1,3,5")
+
+    p_agent_import = sub.add_parser("agent-import", help="把 Agent 评估结果 JSON 写回简历库")
+    p_agent_import.add_argument("--in", required=True, dest="in_file",
+                                help="结果文件路径（JSON 数组，格式见 agent-export 批次内说明）")
+    p_agent_import.add_argument("--template", required=True, help="筛选模板 JSON 路径")
+
     args = parser.parse_args(argv)
     if getattr(args, "ids", None):
         args.ids = [int(x) for x in re.split(r"[,\s]+", args.ids.strip()) if x]
 
     handlers = {"import": cmd_import, "list": cmd_list, "screen": cmd_screen,
-                "export": cmd_export, "providers": cmd_providers, "search": cmd_search}
+                "export": cmd_export, "providers": cmd_providers, "search": cmd_search,
+                "agent-export": cmd_agent_export, "agent-import": cmd_agent_import}
     return handlers[args.command](args)
 
 

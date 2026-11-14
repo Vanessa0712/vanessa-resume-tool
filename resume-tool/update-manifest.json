@@ -1,0 +1,12 @@
+{
+  "version": "ver1.2.0",
+  "channel": "Beta",
+  "date": "2026-11-14",
+  "title": "综合设置与 WorkBuddy Agent 协作筛选",
+  "notes": [
+    "侧边栏 AI 设置升级为综合设置，新增版本更新检查",
+    "新增 Agent 协作筛选：脱敏批次导出、会话内评估、结果写回",
+    "配套 resume-tool-agent 技能，可用一句话触发完整筛选流程"
+  ],
+  "download_url": ""
+}
