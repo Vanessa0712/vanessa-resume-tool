@@ -13,7 +13,7 @@
   <form method="post" action="{{ url_for('screen_run') }}" id="screen-form">
     <div class="form-row">
       <label class="form-label">筛选模板
-        <span class="muted">（可多选 · 搜索模板名或技能 · ★ 收藏置顶）</span>
+        <span class="muted">（可多选 · 搜索模板名或技能 · ★ 收藏置顶 · 选择自动记住）</span>
         <a class="link small" href="{{ url_for('templates_page') }}">管理模板</a>
       </label>
 
@@ -39,6 +39,7 @@
         </div>
       </div>
       <div id="tpl-hidden"></div>
+      <p class="hint tpl-memory" id="tpl-memory" hidden></p>
       <p class="hint" id="tpl-cost" style="margin-bottom:0"></p>
     </div>
 
@@ -157,6 +158,30 @@
   {% endif %}
 </div>
 {% endfor %}
+
+<div class="modal-mask" id="cost-modal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">确认 AI 调用量</div>
+        <div class="modal-sub">AI 引擎按调用次数计费，请确认后再开始</div>
+      </div>
+      <button class="modal-x" type="button" data-close="cost-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p>本次将执行 <b id="cost-templates">0</b> 个模板，覆盖 <b id="cost-resumes">0</b> 份简历。</p>
+      <p>预计调用量：<b id="cost-calls">0</b> 次 <span class="muted" id="cost-kind"></span></p>
+      <p class="hint" id="cost-note"></p>
+      <p class="hint">实际费用取决于所选厂商的单价、输入长度和失败重试次数；漏斗模式只对关键词判定为「待核实」的简历调用 AI，通常明显少于上限。</p>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-foot-actions">
+        <button class="btn btn-secondary" type="button" data-close="cost-modal">取消</button>
+        <button class="btn btn-primary" type="button" id="cost-confirm">确认并开始</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -166,11 +191,15 @@
   const TPL = {{ tpl_meta|tojson }};
   const FAVS = new Set({{ favorites|tojson }});
   const FROM_URL = {{ slugs|tojson }};
+  const SAVED = {{ saved_templates|tojson }};
+  const REMEMBERED = {{ 'true' if remembered else 'false' }};
+  const SAVE_URL = {{ url_for('screen_templates_save')|tojson }};
   const RESUME_TOTAL = {{ resume_total }};
   const RECENT_KEY = 'rt_recent_tpl';
   const DEPT_ORDER = ["收藏", "最近使用", "人事", "电气", "业务", "IT", "未分类"];
 
-  const selected = new Set(FROM_URL.length ? FROM_URL : (TPL[0] ? [TPL[0].slug] : []));
+  const initial = FROM_URL.length ? FROM_URL : (SAVED.length ? SAVED : (TPL[0] ? [TPL[0].slug] : []));
+  const selected = new Set(initial);
   let recents = [];
   try { recents = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch (e) { recents = []; }
 
@@ -312,9 +341,25 @@
 
   function render() { renderChips(); renderOptions(); }
 
+  // 勾选变化即保存，未运行筛选也能在下次打开时恢复
+  let saveTimer = null;
+  function persist() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      const body = new URLSearchParams();
+      [...selected].forEach(s => body.append('templates', s));
+      fetch(SAVE_URL, {
+        method: 'POST',
+        body,
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      }).catch(() => { /* 网络异常时保持本次选择，不影响使用 */ });
+    }, 350);
+  }
+
   function toggleSlug(slug) {
     if (selected.has(slug)) selected.delete(slug); else selected.add(slug);
     render();
+    persist();
   }
 
   async function favSlug(slug) {
@@ -381,10 +426,12 @@
   document.getElementById('tpl-clear').addEventListener('click', () => {
     selected.clear();
     render();
+    persist();
   });
   document.getElementById('tpl-select-all').addEventListener('click', () => {
     document.querySelectorAll('.tpl-opt').forEach(el => selected.add(el.dataset.slug));
     render();
+    persist();
   });
 
   // 提交前记录最近使用
@@ -393,6 +440,15 @@
     const merged = [...selected, ...recents.filter(s => !selected.has(s))].slice(0, 5);
     try { localStorage.setItem(RECENT_KEY, JSON.stringify(merged)); } catch (e) { /* 忽略 */ }
   });
+
+  const memoryEl = document.getElementById('tpl-memory');
+  if (memoryEl && (REMEMBERED || SAVED.length)) {
+    const n = selected.size;
+    memoryEl.textContent = n
+      ? `已恢复上次选择的 ${n} 个模板；勾选变化会自动记住`
+      : '上次的选择已清空';
+    memoryEl.hidden = false;
+  }
 
   render();
 })();
@@ -415,13 +471,21 @@
   async function poll() {
     try {
       const res = await fetch(card.dataset.url, { cache: 'no-store' });
+      const j = await res.json().catch(() => ({}));
+      if (j.state === 'missing' || res.status === 404) {
+        clearInterval(timer);
+        stateEl.textContent = '任务已失效';
+        if (currentEl) {
+          currentEl.textContent = `${j.message || '任务不存在或已过期'}；已完成的结果已写入简历库，请刷新页面查看`;
+        }
+        return;
+      }
       if (!res.ok) return;
-      const j = await res.json();
       fill.style.width = (j.pct || 0) + '%';
       countEl.textContent = `${j.done} / ${j.total || '?'}`;
       if (currentEl) currentEl.textContent = j.current || '准备中';
       stateEl.textContent = j.state === 'running' ? `进行中 ${j.pct}%` : j.state;
-      if (j.state === 'done' || j.state === 'error' || j.state === 'missing') {
+      if (j.state === 'done' || j.state === 'error') {
         clearInterval(timer);
         window.location.href = card.dataset.doneUrl;
       }
@@ -502,6 +566,44 @@
   document.addEventListener('tpl-change', updateHint);
   updateHint();
   syncIds();
+})();
+
+// ---- AI/漏斗费用前置确认 ----
+(function () {
+  const form = document.getElementById('screen-form');
+  const modal = document.getElementById('cost-modal');
+  if (!form || !modal) return;
+  let confirmed = false;
+
+  form.addEventListener('submit', e => {
+    if (confirmed) return;
+    const engine = (document.querySelector('input[name="engine"]:checked') || {}).value;
+    if (engine !== 'ai' && engine !== 'funnel') return;
+    const tplCount = document.querySelectorAll('#tpl-hidden input[name="templates"]').length;
+    const scope = (document.querySelector('input[name="scope"]:checked') || {}).value || 'all';
+    const picked = document.querySelectorAll('.pick-item:checked').length;
+    const resumeCount = scope === 'selected' ? picked : {{ resume_total }};
+    if (!tplCount || !resumeCount) return;
+
+    e.preventDefault();
+    const calls = tplCount * resumeCount;
+    document.getElementById('cost-templates').textContent = tplCount;
+    document.getElementById('cost-resumes').textContent = resumeCount;
+    document.getElementById('cost-calls').textContent = calls;
+    document.getElementById('cost-kind').textContent = scope === 'unscreened' ? '（按全库上限估算）' : '';
+    document.getElementById('cost-note').textContent = engine === 'funnel'
+      ? '漏斗模式：先做关键词初筛，AI 只复核「待核实」名单，这是调用量上限。'
+      : 'AI 模式会对范围内每份简历逐份调用一次。';
+    openModal('cost-modal');
+  });
+
+  document.getElementById('cost-confirm').addEventListener('click', () => {
+    confirmed = true;
+    closeModal('cost-modal');
+    const btn = document.getElementById('screen-submit');
+    if (btn) { btn.disabled = true; btn.textContent = '正在创建任务…'; }
+    form.requestSubmit();
+  });
 })();
 </script>
 {% endblock %}

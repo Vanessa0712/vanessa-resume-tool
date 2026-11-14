@@ -15,10 +15,15 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
+import platform
 import re
 import shutil
+import sqlite3
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -26,30 +31,187 @@ import urllib.request
 import uuid
 import zipfile
 from datetime import date, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from types import SimpleNamespace
 
 from flask import (
-    Flask, abort, flash, redirect, render_template, request, send_file,
-    url_for,
+    Flask, abort, flash, g, has_app_context, redirect, render_template, request,
+    send_file, url_for,
 )
+from werkzeug.exceptions import HTTPException
 
 import resume_tool as rt
 
-BASE = Path(__file__).parent
-DB = str(BASE / "resume_tool.db")
-TPL_DIR = BASE / "config" / "templates"
-PROVIDERS_PATH = BASE / "config" / "providers.json"
-APP_SETTINGS_PATH = BASE / "config" / "app_settings.json"
-UPDATE_MANIFEST_PATH = BASE / "update-manifest.json"
-UPLOAD_DIR = BASE / "uploads"
+CODE_DIR = Path(__file__).resolve().parent
+RESOURCE_BASE = Path(getattr(sys, "_MEIPASS", CODE_DIR))
+
+
+def resolve_data_dir() -> Path:
+    """可写数据目录：显式环境变量 > 打包 exe 的 LOCALAPPDATA > 源码项目目录."""
+    configured = os.environ.get("RESUME_TOOL_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(local) if local else (Path.home() / ".resume-tool")
+        return (root / "ResumeTool").resolve()
+    return CODE_DIR
+
+
+DATA_DIR = resolve_data_dir()
+DB = str(DATA_DIR / "resume_tool.db")
+CONFIG_DIR = DATA_DIR / "config"
+TPL_DIR = CONFIG_DIR / "templates"
+PROVIDERS_PATH = CONFIG_DIR / "providers.json"
+APP_SETTINGS_PATH = CONFIG_DIR / "app_settings.json"
+UPLOAD_DIR = DATA_DIR / "uploads"
+BACKUP_DIR = DATA_DIR / "backups"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "resume-tool.log"
+GITHUB_REPOSITORY = "Vanessa0712/vanessa-resume-tool"
+GITHUB_LATEST_RELEASE_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+)
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
+
+
+def _copy_file_if_missing(src: Path, dst: Path) -> None:
+    if src.is_file() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _copy_dir_missing(src: Path, dst: Path) -> None:
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def ensure_data_layout() -> None:
+    """创建可写数据目录，并把旧源码目录/旧 exe 旁的数据复制过来（不删除旧数据）."""
+    try:
+        for directory in (DATA_DIR, CONFIG_DIR, TPL_DIR, UPLOAD_DIR, BACKUP_DIR, LOG_DIR):
+            directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"无法创建数据目录 {DATA_DIR}：{exc}") from exc
+
+    bundled_templates = RESOURCE_BASE / "config" / "templates"
+    if bundled_templates.resolve() != TPL_DIR.resolve():
+        for path in bundled_templates.glob("*.json"):
+            if not path.name.startswith("."):
+                _copy_file_if_missing(path, TPL_DIR / path.name)
+
+    if DATA_DIR.resolve() == CODE_DIR.resolve():
+        return
+
+    candidates = [CODE_DIR]
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(sys.executable).resolve().parent)
+    for legacy in candidates:
+        if legacy.resolve() == DATA_DIR.resolve() or not (legacy / "resume_tool.db").is_file():
+            continue
+        for name in ("resume_tool.db", "resume_tool.db-wal", "resume_tool.db-shm"):
+            _copy_file_if_missing(legacy / name, DATA_DIR / name)
+        _copy_dir_missing(legacy / "uploads", UPLOAD_DIR)
+        _copy_dir_missing(legacy / "backups", BACKUP_DIR)
+        _copy_file_if_missing(legacy / "config" / "providers.json", PROVIDERS_PATH)
+        _copy_file_if_missing(legacy / "config" / "app_settings.json", APP_SETTINGS_PATH)
+        legacy_templates = legacy / "config" / "templates"
+        if legacy_templates.is_dir():
+            for path in legacy_templates.glob("*.json"):
+                if not path.name.startswith("."):
+                    _copy_file_if_missing(path, TPL_DIR / path.name)
+        break
+
+
+ensure_data_layout()
 
 app = Flask(__name__)
 app.secret_key = "resume-tool-local-dev"  # 本地原型，无跨用户场景
 app.config["TEMPLATES_AUTO_RELOAD"] = True  # UI 迭代期模板改动即时生效，无需重启
+# 只接受回环地址的 Host，阻断 DNS rebinding；本应用仅面向 127.0.0.1 单机使用。
+app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "127.0.0.1:5000", "localhost:5000"]
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 上传/恢复上限，兼顾批量简历与数据库备份
+
+
+def configure_logging() -> None:
+    """运行日志写入数据目录：打包成无控制台 exe 后仍能排查现场问题."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+    handler.setLevel(logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # 避免重复添加（测试或多处导入时）
+    for existing in root.handlers:
+        if isinstance(existing, RotatingFileHandler) and \
+                Path(getattr(existing, "baseFilename", "")) == LOG_FILE:
+            return
+    root.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
+
+
+@app.before_request
+def protect_local_mutations():
+    """本地写操作只接受同源页面发起，挡住跨站表单提交的基本路径."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    allowed = {request.host_url.rstrip("/"), "http://127.0.0.1:5000", "http://localhost:5000"}
+    origin = (request.headers.get("Origin") or "").rstrip("/")
+    if origin and origin not in allowed:
+        abort(403)
+    referer = request.headers.get("Referer") or ""
+    if referer and not any(referer.startswith(base + "/") for base in allowed):
+        abort(403)
+    return None
 
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
+    {
+        "version": "ver1.2.3",
+        "channel": "Beta",
+        "date": "2026-11-14",
+        "title": "筛选中心记住模板选择",
+        "entries": [
+            "筛选中心勾选的模板自动记住，重启程序或第二天打开自动恢复，不用反复重选",
+            "勾选变化即时保存，不运行筛选也会记住；开始筛选时同样写入",
+            "模板被删除或改名后自动从记忆中剔除，不会出现无效选择",
+            "应用设置改为原子写入，避免异常退出留下半截配置文件",
+        ],
+    },
+    {
+        "version": "ver1.2.2",
+        "channel": "Beta",
+        "date": "2026-11-14",
+        "title": "隐私清理、运行日志与诊断包",
+        "entries": [
+            "彻底删除简历时同步清理数据目录内的原始文件；数据目录之外的历史文件不会被擅自删除，只提示",
+            "设置页新增「清理孤立原文件」：找出重复导入留下的副本并释放磁盘空间，已导入简历的文件不受影响",
+            "运行日志写入数据目录 logs/，按 2MB 滚动保留 5 份，打包成无控制台程序后仍能排查现场问题",
+            "页面异常显示错误编号并写入日志，便于按编号定位",
+            "设置页新增「导出诊断包」：环境、数据规模统计、脱敏配置和最近日志，不含简历正文与 API Key",
+        ],
+    },
+    {
+        "version": "ver1.2.1",
+        "channel": "Beta",
+        "date": "2026-11-14",
+        "title": "数据可移植与企业可用性",
+        "entries": [
+            "数据目录与安装目录分离：打包后默认使用 LOCALAPPDATA，支持环境变量指定并自动迁移旧数据",
+            "目录导入与上传文件统一复制进数据目录，数据库改存 uploads 相对路径；备份换机后原文件仍可打开",
+            "全新机器可直接从备份恢复，不再要求目标机器先有数据库",
+            "设置页新增数据备份与恢复：一致性快照、可选原始文件、每日自动备份、恢复前备份",
+            "每次导入生成批次记录，逐文件展示新增、恢复、重复、无法解析和异常原因",
+            "AI/漏斗提交前确认预计调用量；修复导出重复、CSV 口径、配置锁死与后台任务卡死",
+        ],
+    },
     {
         "version": "ver1.2.0",
         "channel": "Beta",
@@ -158,20 +320,81 @@ STATUS_ORDER = {"通过": 0, "待核实": 1, "未通过": 2}
 # ---------- 数据辅助 ----------
 
 def db():
-    return rt.get_conn(DB)
+    """请求内复用同一连接并随请求关闭；后台线程自行创建、自行关闭."""
+    if not has_app_context():
+        return rt.get_conn(DB)
+    if "db_conn" not in g:
+        g.db_conn = rt.get_conn(DB)
+    return g.db_conn
+
+
+@app.teardown_appcontext
+def close_db(_exc=None) -> None:
+    conn = g.pop("db_conn", None)
+    if conn is not None:
+        conn.close()
+
+
+def stored_resume_path(raw: str) -> Path:
+    """把数据库中的路径解析为当前机器路径；uploads/... 为相对数据目录."""
+    path = Path(raw)
+    return path if path.is_absolute() else (DATA_DIR / path).resolve()
+
+
+def normalize_upload_paths(conn) -> int:
+    """把历史绝对路径中的 uploads/... 片段改为相对路径，便于换机和恢复."""
+    changed = 0
+    rows = conn.execute("SELECT id, path FROM resumes WHERE path IS NOT NULL").fetchall()
+    for rid, raw_path in rows:
+        raw = str(raw_path or "")
+        path = Path(raw)
+        if not path.is_absolute():
+            continue
+        parts = list(path.parts)
+        try:
+            idx = len(parts) - 1 - parts[::-1].index("uploads")
+        except ValueError:
+            continue
+        tail = parts[idx + 1:]
+        if not tail:
+            continue
+        stored = Path("uploads", *tail).as_posix()
+        conn.execute("UPDATE resumes SET path=? WHERE id=?", (stored, rid))
+        changed += 1
+    if changed:
+        conn.commit()
+    return changed
 
 
 DEPT_ORDER = ["人事", "电气", "业务", "IT"]
+TEMPLATE_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 
 
 def dept_sort_key(dept: str) -> tuple:
     return (DEPT_ORDER.index(dept) if dept in DEPT_ORDER else len(DEPT_ORDER), dept)
 
 
+def template_dest(slug: str) -> Path | None:
+    """模板写入路径：只接受小写 slug，并确认最终路径仍在模板目录内."""
+    if not TEMPLATE_SLUG_RE.fullmatch(slug or ""):
+        return None
+    base = TPL_DIR.resolve()
+    path = (base / f"{slug}.json").resolve()
+    return path if path.parent == base else None
+
+
+def template_path(slug: str) -> Path | None:
+    """已存在模板的安全路径；非法或越界一律返回 None."""
+    path = template_dest(slug)
+    return path if path is not None and path.is_file() else None
+
+
 def list_templates() -> list[dict]:
     """扫描模板目录，返回模板元信息（含部门/子职业，供分组与搜索）."""
     items = []
     for p in sorted(TPL_DIR.glob("*.json")):
+        if p.name.startswith("."):
+            continue
         try:
             tpl = rt.load_template(p)
             raw = json.loads(p.read_text(encoding="utf-8"))
@@ -185,7 +408,7 @@ def list_templates() -> list[dict]:
                 "core_count": len(tpl.core_skills),
                 "nice_count": len(tpl.nice_to_have),
             })
-        except SystemExit:
+        except (SystemExit, Exception):
             items.append({"slug": p.stem, "name": p.stem + "（配置有误）",
                           "department": "未分类", "role": "", "skills": [],
                           "required": "-", "min_years": None, "core_count": 0, "nice_count": 0})
@@ -195,7 +418,7 @@ def list_templates() -> list[dict]:
 
 def get_favorites() -> list[str]:
     favs = load_app_settings().get("favorites", [])
-    return [s for s in favs if isinstance(s, str) and (TPL_DIR / f"{s}.json").is_file()]
+    return [s for s in favs if isinstance(s, str) and template_path(s) is not None]
 
 
 def toggle_favorite(slug: str) -> bool:
@@ -212,6 +435,31 @@ def toggle_favorite(slug: str) -> bool:
     return on
 
 
+def get_screen_templates() -> list[str]:
+    """上次在筛选中心勾选的模板；模板被删除后自动忽略."""
+    saved = load_app_settings().get("screen_templates", [])
+    if not isinstance(saved, list):
+        return []
+    out: list[str] = []
+    for slug in saved:
+        if isinstance(slug, str) and slug not in out and template_path(slug) is not None:
+            out.append(slug)
+    return out
+
+
+def save_screen_templates(slugs: list[str]) -> list[str]:
+    """记住筛选中心的模板选择，供下次启动自动恢复；返回实际保存的 slug."""
+    valid: list[str] = []
+    for slug in slugs:
+        if slug not in valid and template_path(slug) is not None:
+            valid.append(slug)
+    cfg = load_app_settings()
+    if cfg.get("screen_templates") != valid:
+        cfg["screen_templates"] = valid
+        save_app_settings(cfg)
+    return valid
+
+
 def latest_map(conn, template: str | None = None) -> dict[int, dict[str, dict]]:
     """每份简历每个引擎的最新一次筛选结果（可选按模板过滤）."""
     sql = "SELECT * FROM screenings"
@@ -226,17 +474,25 @@ def latest_map(conn, template: str | None = None) -> dict[int, dict[str, dict]]:
     return result
 
 
-def provider_status() -> tuple[dict, dict | None]:
-    providers = rt.load_providers(PROVIDERS_PATH)
-    return providers, rt.get_active_provider(providers)
+def provider_status() -> tuple[dict, dict | None, str]:
+    """返回配置、当前可用厂商和可展示错误；配置问题不再终止 Web 进程."""
+    try:
+        providers = rt.ensure_providers(PROVIDERS_PATH)
+    except (OSError, rt.ProviderConfigError) as exc:
+        return rt.default_providers(), None, f"AI 配置读取失败：{exc}"
+    try:
+        return providers, rt.get_active_provider(providers), ""
+    except (AttributeError, TypeError) as exc:
+        return rt.default_providers(), None, f"AI 配置结构不正确：{exc}"
 
 
 def load_app_settings() -> dict:
     defaults = {
         "preview_method": "default",
         "cloud_url": "https://docs.qq.com/desktop",
-        "update_url": "",  # 留空读取项目根 update-manifest.json；分发时填固定 HTTPS 地址
         "auto_check_updates": True,
+        "auto_backup": True,
+        "screen_templates": [],
     }
     if APP_SETTINGS_PATH.is_file():
         try:
@@ -247,11 +503,261 @@ def load_app_settings() -> dict:
 
 
 def save_app_settings(data: dict) -> None:
+    """原子写入：先写临时文件再替换，避免断电/中断留下半截 JSON."""
     APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APP_SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = APP_SETTINGS_PATH.with_name(APP_SETTINGS_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(APP_SETTINGS_PATH)
 
 
-# ---------- 版本更新（manifest 驱动） ----------
+# ---------- 备份与恢复 ----------
+
+def _safe_backup_name(name: str) -> bool:
+    return bool(re.fullmatch(r"resume-tool-(?:auto|manual|pre-restore)-\d{8}-\d{6}(?:-\d+)?\.zip", name or ""))
+
+
+def list_backups() -> list[dict]:
+    if not BACKUP_DIR.is_dir():
+        return []
+    items = []
+    for path in BACKUP_DIR.glob("*.zip"):
+        if not _safe_backup_name(path.name):
+            continue
+        stat = path.stat()
+        kind = "自动" if "-auto-" in path.name else (
+            "恢复前" if "-pre-restore-" in path.name else "手动")
+        size_kb = stat.st_size / 1024
+        size_text = (f"{size_kb:.0f} KB" if size_kb < 1024
+                     else f"{size_kb / 1024:.1f} MB")
+        items.append({
+            "name": path.name,
+            "kind": kind,
+            "size_text": size_text,
+            "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        })
+    return sorted(items, key=lambda item: item["name"], reverse=True)
+
+
+def _prune_backups() -> None:
+    """自动备份保留 7 份、恢复前备份 3 份、手动备份 20 份."""
+    groups = {"auto": 7, "pre-restore": 3, "manual": 20}
+    for kind, keep in groups.items():
+        files = sorted(BACKUP_DIR.glob(f"resume-tool-{kind}-*.zip"), reverse=True)
+        for path in files[keep:]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def create_backup(label: str = "manual", include_uploads: bool = False) -> Path:
+    """生成一致性 ZIP：数据库（SQLite backup API）+ 配置；可选原始文件."""
+    if not Path(DB).is_file():
+        raise ValueError("简历库尚未创建，暂无内容可备份")
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"resume-tool-{label}-{stamp}"
+    target = BACKUP_DIR / f"{base}.zip"
+    n = 2
+    while target.exists():
+        target = BACKUP_DIR / f"{base}-{n}.zip"
+        n += 1
+
+    with tempfile.TemporaryDirectory(prefix="resume-tool-backup-") as td:
+        tmp_db = Path(td) / "resume_tool.db"
+        src = sqlite3.connect(DB)
+        dst = sqlite3.connect(tmp_db)
+        try:
+            src.backup(dst)
+            check = dst.execute("PRAGMA integrity_check").fetchone()
+            if not check or check[0] != "ok":
+                raise ValueError("数据库完整性检查未通过，未生成备份")
+        finally:
+            dst.close()
+            src.close()
+
+        counts = {}
+        db_conn = sqlite3.connect(tmp_db)
+        try:
+            for table in ("resumes", "persons", "screenings"):
+                counts[table] = db_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            db_conn.close()
+
+        metadata = {
+            "app_version": current_version(),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "include_uploads": bool(include_uploads),
+            "counts": counts,
+        }
+        try:
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(tmp_db, "resume_tool.db")
+                for path, arc in (
+                    (APP_SETTINGS_PATH, "config/app_settings.json"),
+                    (PROVIDERS_PATH, "config/providers.json"),
+                ):
+                    if path.is_file():
+                        zf.write(path, arc)
+                for path in sorted(TPL_DIR.glob("*.json")):
+                    if not path.name.startswith("."):
+                        zf.write(path, f"config/templates/{path.name}")
+                if include_uploads and UPLOAD_DIR.is_dir():
+                    for path in UPLOAD_DIR.rglob("*"):
+                        if path.is_file():
+                            zf.write(path, "uploads/" + path.relative_to(UPLOAD_DIR).as_posix())
+                zf.writestr("backup-meta.json",
+                            json.dumps(metadata, ensure_ascii=False, indent=2))
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+    _prune_backups()
+    return target
+
+
+def maybe_auto_backup() -> Path | None:
+    """每天首次启动自动备份一次（不含原始文件，避免拖慢启动）."""
+    if not Path(DB).is_file():
+        return None
+    today = datetime.now().strftime("%Y%m%d")
+    if any(f"resume-tool-auto-{today}" in p.name for p in BACKUP_DIR.glob("*.zip")):
+        return None
+    return create_backup("auto", include_uploads=False)
+
+
+def backup_file(name: str) -> Path | None:
+    if not _safe_backup_name(name):
+        return None
+    path = (BACKUP_DIR / name).resolve()
+    return path if path.parent == BACKUP_DIR.resolve() and path.is_file() else None
+
+
+def _validate_restore_db(path: Path) -> None:
+    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    try:
+        check = conn.execute("PRAGMA integrity_check").fetchone()
+        if not check or check[0] != "ok":
+            raise ValueError("备份中的数据库完整性检查未通过")
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        missing = {"resumes", "persons", "screenings"} - tables
+        if missing:
+            raise ValueError(f"备份不是有效的简历库，缺少表：{', '.join(sorted(missing))}")
+    finally:
+        conn.close()
+
+
+def restore_backup(archive: Path) -> dict:
+    """从备份 ZIP/DB 恢复；恢复前必定先生成 pre-restore 备份."""
+    with JOBS_LOCK:
+        active = any(j.get("state") in ("queued", "running") for j in JOBS.values())
+    if active:
+        raise ValueError("仍有筛选任务在运行，请等待完成或重启应用后再恢复")
+
+    restored_uploads = 0
+    with tempfile.TemporaryDirectory(prefix="resume-tool-restore-") as td:
+        temp = Path(td)
+        db_file = archive
+        config_entries: dict[str, bytes] = {}
+        upload_entries: list[tuple[str, zipfile.ZipInfo]] = []
+        zf = None
+        if archive.suffix.lower() == ".zip":
+            zf = zipfile.ZipFile(archive)
+            try:
+                names = {info.filename: info for info in zf.infolist()}
+                if "resume_tool.db" not in names:
+                    raise ValueError("备份包中缺少 resume_tool.db")
+                info = names["resume_tool.db"]
+                if info.file_size > 1024 * 1024 * 1024:
+                    raise ValueError("备份中的数据库超过 1GB，已拒绝恢复")
+                db_file = temp / "resume_tool.db"
+                with zf.open(info) as src, open(db_file, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                allowed_config = {"config/app_settings.json", "config/providers.json"}
+                for name, info in names.items():
+                    if name in allowed_config:
+                        if info.file_size <= 5 * 1024 * 1024:
+                            config_entries[name] = zf.read(info)
+                    elif name.startswith("config/templates/") and name.endswith(".json"):
+                        slug = name[len("config/templates/"):-len(".json")]
+                        if re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug) \
+                                and info.file_size <= 5 * 1024 * 1024:
+                            config_entries[name] = zf.read(info)
+                    elif name.startswith("uploads/") and not name.endswith("/"):
+                        rel = name[len("uploads/"):]
+                        if (rel and ".." not in Path(rel).parts
+                                and not Path(rel).is_absolute()
+                                and info.file_size <= 256 * 1024 * 1024):
+                            upload_entries.append((rel, info))
+            finally:
+                zf.close()
+
+        _validate_restore_db(db_file)
+        pre = (create_backup("pre-restore", include_uploads=False)
+               if Path(DB).is_file() else None)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+        conn = g.pop("db_conn", None)
+        if conn is not None:
+            conn.close()
+        src = sqlite3.connect(db_file)
+        dst = sqlite3.connect(DB)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        rt._MIGRATED_DBS.clear()
+        rt._FTS_STATE.clear()
+        path_conn = sqlite3.connect(DB)
+        try:
+            normalize_upload_paths(path_conn)
+        finally:
+            path_conn.close()
+
+        for name, raw in config_entries.items():
+            try:
+                json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            try:
+                if name == "config/providers.json":
+                    rt.write_providers(PROVIDERS_PATH, json.loads(raw.decode("utf-8")))
+                elif name == "config/app_settings.json":
+                    APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    APP_SETTINGS_PATH.write_bytes(raw)
+                else:
+                    dest = template_dest(Path(name).stem)
+                    if dest is not None:
+                        dest.write_bytes(raw)
+            except OSError:
+                pass  # 数据库已恢复成功，单个配置写入失败不应把整体判为失败
+
+        if upload_entries and zf is not None:
+            zf = zipfile.ZipFile(archive)
+            try:
+                for rel, info in upload_entries:
+                    dest = (UPLOAD_DIR / Path(rel)).resolve()
+                    if not dest.is_relative_to(UPLOAD_DIR.resolve()):
+                        continue
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info) as src, open(dest, "wb") as out:
+                            shutil.copyfileobj(src, out)
+                        restored_uploads += 1
+                    except OSError:
+                        continue
+            finally:
+                zf.close()
+    return {"pre_backup": pre.name if pre else "", "uploads": restored_uploads}
+
+
+# ---------- 版本更新（GitHub 最新正式 Release） ----------
+
+_update_condition = threading.Condition()
+_update_result: dict | None = None
+_update_checking = False
+
 
 def current_version() -> str:
     return CHANGELOG[0]["version"] if CHANGELOG else "ver0.0.0"
@@ -263,50 +769,124 @@ def version_tuple(version: str) -> tuple[int, ...]:
     return tuple((nums + [0, 0, 0, 0])[:4])
 
 
-def _read_update_manifest(source: str) -> tuple[dict, str]:
-    """读取更新 manifest；支持 HTTPS/HTTP、本地路径，空值走项目根默认文件."""
-    source = (source or "").strip()
-    if not source:
-        path = UPDATE_MANIFEST_PATH
-        if not path.is_file():
-            raise ValueError("未配置更新地址，且项目根目录没有 update-manifest.json")
-        return json.loads(path.read_text(encoding="utf-8")), "本地更新清单"
-    if source.startswith(("https://", "http://")):
-        req = urllib.request.Request(
-            source, headers={"User-Agent": f"ResumeTool/{current_version()}"}
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            raw = resp.read(1_000_000).decode("utf-8")  # 限制 1MB，避免异常响应占内存
-        return json.loads(raw), source
-    path = Path(source[7:] if source.startswith("file://") else source)
-    if not path.is_absolute():
-        path = BASE / path
-    return json.loads(path.read_text(encoding="utf-8")), str(path)
+def _update_failure(message: str) -> dict:
+    return {
+        "ok": False,
+        "current_version": current_version(),
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "error": message,
+        "source": f"GitHub Release · {GITHUB_REPOSITORY}",
+    }
+
+
+def _read_github_latest_release() -> dict:
+    """读取固定仓库的最新正式 Release，并适配为统一的更新结果字段."""
+    req = urllib.request.Request(
+        GITHUB_LATEST_RELEASE_URL,
+        headers={
+            "User-Agent": f"ResumeTool/{current_version()}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = resp.read(1_000_001)
+    if len(raw) > 1_000_000:
+        raise ValueError("GitHub Release 响应超过 1MB，已停止读取")
+    release = json.loads(raw.decode("utf-8"))
+    if not isinstance(release, dict):
+        raise ValueError("GitHub Release 响应格式不正确")
+    if release.get("draft") or release.get("prerelease"):
+        raise ValueError("latest 接口返回了草稿或预发布版本，已忽略")
+    body = str(release.get("body") or "")
+    notes = [line.strip() for line in body.splitlines() if line.strip()]
+    return {
+        "version": str(release.get("tag_name") or "").strip(),
+        "title": str(release.get("name") or release.get("tag_name") or ""),
+        "date": str(release.get("published_at") or "")[:10],
+        "notes": notes[:12],
+        # 固定打开发布页，由用户选择源码包或维护者上传的安装包，不自动下载执行。
+        "download_url": str(release.get("html_url") or GITHUB_RELEASES_URL),
+    }
 
 
 def check_for_update() -> dict:
-    """拉取并比较版本；所有异常转为设置页可展示的结果，不让检查失败影响其他设置."""
+    """检查 GitHub 最新正式 Release；失败不会中断应用或误报为已是最新."""
     current = current_version()
     base = {"current_version": current, "checked_at": datetime.now().isoformat(timespec="seconds")}
     try:
-        manifest, source = _read_update_manifest(load_app_settings().get("update_url", ""))
-        latest = str(manifest.get("version", "")).strip()
+        manifest = _read_github_latest_release()
+        latest = manifest["version"]
         if not latest or not re.search(r"\d", latest):
-            raise ValueError("更新清单缺少有效的 version 字段")
-        notes = manifest.get("notes", [])
+            raise ValueError("GitHub Release 缺少有效的 tag_name 版本号")
         return {
             **base,
             "ok": True,
             "latest_version": latest,
             "update_available": version_tuple(latest) > version_tuple(current),
-            "title": str(manifest.get("title", "")),
-            "date": str(manifest.get("date", "")),
-            "notes": [str(n) for n in notes][:12] if isinstance(notes, list) else [],
-            "download_url": str(manifest.get("download_url", "")),
-            "source": source,
+            "title": manifest["title"],
+            "date": manifest["date"],
+            "notes": manifest["notes"],
+            "download_url": manifest["download_url"],
+            "source": f"GitHub Release · {GITHUB_REPOSITORY}",
         }
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            message = "检查失败：仓库尚未发布正式 Release（latest 不包含草稿和预发布版本）"
+        elif exc.code in (403, 429):
+            message = f"检查失败：GitHub API 访问受限或触发限流（HTTP {exc.code}），请稍后再试"
+        else:
+            message = f"检查失败：GitHub 返回 HTTP {exc.code}"
+        return {**base, "ok": False, "error": message,
+                "source": f"GitHub Release · {GITHUB_REPOSITORY}"}
     except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-        return {**base, "ok": False, "error": f"检查失败：{exc}"}
+        return {**base, "ok": False, "error": f"检查失败：{exc}",
+                "source": f"GitHub Release · {GITHUB_REPOSITORY}"}
+
+
+def get_update_status() -> dict:
+    """返回进程内更新状态；查询状态本身不会访问 GitHub."""
+    with _update_condition:
+        state = "checking" if _update_checking else ("done" if _update_result else "idle")
+        result = dict(_update_result) if _update_result else None
+    return {"state": state, "result": result, "current_version": current_version()}
+
+
+def _update_check_worker() -> None:
+    global _update_result, _update_checking
+    try:
+        result = check_for_update()
+    except Exception as exc:  # 后台线程兜底，任何检查异常都不能影响主程序
+        result = _update_failure(f"检查失败：{exc}")
+    with _update_condition:
+        _update_result = result
+        _update_checking = False
+        _update_condition.notify_all()
+    if result.get("update_available"):
+        app.logger.info("发现新版本：%s", result.get("latest_version"))
+    elif not result.get("ok"):
+        app.logger.warning("%s", result.get("error"))
+
+
+def start_update_check() -> bool:
+    """启动一次后台检查；已有检查进行中时返回 False，不重复请求 GitHub."""
+    global _update_result, _update_checking
+    with _update_condition:
+        if _update_checking:
+            return False
+        _update_checking = True
+    try:
+        threading.Thread(
+            target=_update_check_worker,
+            name="resume-tool-update-check",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        with _update_condition:
+            _update_result = _update_failure(f"无法启动更新检查：{exc}")
+            _update_checking = False
+            _update_condition.notify_all()
+    return True
 
 
 @app.context_processor
@@ -319,7 +899,31 @@ def inject_globals() -> dict:
         "today": date.today().isoformat(),
         "open_methods": OPEN_METHODS,
         "app_settings": load_app_settings(),
+        "data_dir": str(DATA_DIR),
     }
+
+
+@app.errorhandler(HTTPException)
+def handle_http_error(exc: HTTPException):
+    code = exc.code or 500
+    messages = {
+        403: ("无权执行此操作", "该请求不是从本机页面发起的，已被安全策略拦截。"),
+        404: ("页面或简历不存在", "链接可能已经失效，或对应记录已被删除。"),
+        413: ("文件太大", "单次上传不能超过 256 MB，请拆分批次或压缩后重试。"),
+    }
+    title, message = messages.get(code, (exc.name or "请求失败", exc.description or "请返回后重试"))
+    return render_template("error.html", code=code, title=title, message=message), code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc: Exception):
+    trace_id = uuid.uuid4().hex[:8].upper()
+    app.logger.exception("未处理的页面异常 [%s]", trace_id)
+    return render_template(
+        "error.html", code=500, title="应用遇到问题",
+        message="本次操作没有完成。已有简历数据不会因此删除，请返回重试。",
+        trace_id=trace_id,
+    ), 500
 
 
 def parse_slugs(raw: str) -> list[str]:
@@ -327,13 +931,31 @@ def parse_slugs(raw: str) -> list[str]:
     out: list[str] = []
     for s in re.split(r"[,\s]+", raw or ""):
         s = s.strip()
-        if s and s not in out and (TPL_DIR / f"{s}.json").is_file():
+        if s and s not in out and template_path(s) is not None:
             out.append(s)
     return out
 
 
 def tpl_name(slug: str) -> str:
-    return rt.load_template(TPL_DIR / f"{slug}.json").name
+    path = template_path(slug)
+    if path is None:
+        raise ValueError("模板不存在或名称不合法")
+    return rt.load_template(path).name
+
+
+def parse_selected_ids(values: list[str]) -> list[int]:
+    """解析 ids（兼容重复参数和逗号分隔），去重并保持选择顺序."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        for raw in re.split(r"[,\s]+", value or ""):
+            if not raw.isdigit():
+                continue
+            rid = int(raw)
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+    return out
 
 
 def unscreened_ids(conn, slug: str) -> list[int]:
@@ -388,19 +1010,24 @@ def job_inc(jid: str, field: str, n: int = 1) -> None:
 
 def run_screening_job(jid: str, engine: str, slugs: list[str], ids: list[int] | None,
                       scope: str = "all") -> None:
-    """在后台线程执行筛选：逐份更新进度，任何异常都记录到 job.errors 而不是中断。"""
+    """在后台线程执行筛选：逐份更新进度，任何异常都落到任务状态而不是让进度卡死。"""
+    conn = None
     try:
         conn = db()
-        _, provider = provider_status()
+        _, provider, provider_error = provider_status()
         if engine == "ai" and provider is None:
+            reason = provider_error or "请先在「设置 → AI 厂商配置」中填写 API Key"
             job_update(jid, state="error",
-                       message="AI 未配置：请先在「AI 设置」中填写 API Key，或改用关键词引擎")
+                       message=f"AI 未就绪：{reason}；也可改用关键词引擎")
             return
 
         # 先规划：每个模板要处理的简历集合，便于算出总进度
         plan = []
         for slug in slugs:
-            tpl = rt.load_template(TPL_DIR / f"{slug}.json")
+            path = template_path(slug)
+            if path is None:
+                raise ValueError(f"模板 {slug} 不存在或名称不合法")
+            tpl = rt.load_template(path)
             target = ids if scope == "selected" else (
                 unscreened_ids(conn, slug) if scope == "unscreened" else None)
             plan.append((tpl, rt._fetch_resumes(conn, target)))
@@ -461,14 +1088,24 @@ def run_screening_job(jid: str, engine: str, slugs: list[str], ids: list[int] | 
 
         head = f"已按 {len(slugs)} 个模板执行筛选。" if len(slugs) > 1 else ""
         job_update(jid, state="done", current="", message=head + "；".join(messages))
-    except Exception as exc:  # 线程内不抛给 Flask，转成任务错误信息
-        job_update(jid, state="error", current="", message=f"筛选任务异常：{exc}")
+    except BaseException as exc:  # 包含配置/模板读取抛出的 SystemExit，避免任务永久卡住
+        detail = str(exc) or exc.__class__.__name__
+        job_update(jid, state="error", current="", message=f"筛选任务失败：{detail}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def start_job(engine: str, slugs: list[str], ids: list[int] | None, scope: str) -> str:
     jid = job_new(engine, slugs, scope)
-    threading.Thread(target=run_screening_job, args=(jid, engine, slugs, ids, scope),
-                     daemon=True).start()
+    try:
+        threading.Thread(target=run_screening_job, args=(jid, engine, slugs, ids, scope),
+                         daemon=True).start()
+    except Exception as exc:
+        job_update(jid, state="error", message=f"无法启动筛选任务：{exc}")
     return jid
 
 
@@ -488,7 +1125,7 @@ def library():
     templates = list_templates()
     tpl_filter = request.args.get("template", "all")
     tpl_label = None
-    if tpl_filter != "all" and (TPL_DIR / f"{tpl_filter}.json").is_file():
+    if tpl_filter != "all" and template_path(tpl_filter) is not None:
         tpl_label = tpl_name(tpl_filter)
     else:
         tpl_filter = "all"
@@ -546,19 +1183,78 @@ def library():
                            active="library")
 
 
+def _batch_start(conn, source: str, total: int) -> int:
+    cur = conn.execute(
+        "INSERT INTO import_batches(source, created_at, total) VALUES(?,?,?)",
+        (source, datetime.now().isoformat(timespec="seconds"), total),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _batch_item(conn, batch_id: int, filename: str, result: str, detail: str) -> None:
+    conn.execute(
+        "INSERT INTO import_batch_items(batch_id, filename, result, detail, created_at)"
+        " VALUES(?,?,?,?,?)",
+        (batch_id, filename, result, detail,
+         datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def _batch_finish(conn, batch_id: int, counts: dict) -> None:
+    conn.execute(
+        "UPDATE import_batches SET finished_at=?, added=?, restored=?, dup=?, empty=?, errors=?"
+        " WHERE id=?",
+        (datetime.now().isoformat(timespec="seconds"), counts["added"],
+         counts["restored"], counts["dup"], counts["empty"], counts["errors"], batch_id),
+    )
+    conn.commit()
+
+
+def _import_summary(counts: dict) -> str:
+    return (f"新增 {counts['added']}，恢复 {counts['restored']}，重复 {counts['dup']}，"
+            f"无法解析 {counts['empty']}，异常 {counts['errors']}")
+
+
 @app.post("/import-dir")
 def import_dir():
     src = Path(request.form.get("dir", "").strip())
     if not src.is_dir():
         flash(f"目录不存在: {src}", "error")
         return redirect(url_for("library"))
+    files = [p for p in sorted(src.iterdir())
+             if p.is_file() and p.suffix.lower() in rt.SUPPORTED_SUFFIXES
+             and not p.name.startswith("~$")]
+    if not files:
+        flash("该目录下没有可导入的简历文件", "error")
+        return redirect(url_for("library"))
     conn = db()
-    counts = {"added": 0, "restored": 0, "dup": 0, "empty": 0}
-    for p in sorted(src.iterdir()):
-        if p.is_file() and p.suffix.lower() in rt.SUPPORTED_SUFFIXES and not p.name.startswith("~$"):
-            counts[rt.import_one(conn, p)] += 1
-    flash(f"导入完成：新增 {counts['added']}，从回收站恢复 {counts['restored']}，重复 {counts['dup']}，无法解析 {counts['empty']}")
-    return redirect(url_for("library"))
+    counts = {"added": 0, "restored": 0, "dup": 0, "empty": 0, "errors": 0}
+    batch_id = _batch_start(conn, f"本机目录：{src}", len(files))
+    copied_dir = UPLOAD_DIR / f"dir-{int(time.time() * 1000)}"
+    copied_dir.mkdir(parents=True, exist_ok=True)
+    for p in files:
+        dest = copied_dir / f"{p.stem[:160]}{p.suffix}"
+        n = 2
+        while dest.exists():
+            dest = copied_dir / f"{p.stem[:150]}-{n}{p.suffix}"
+            n += 1
+        try:
+            shutil.copy2(p, dest)
+            result, detail, _ = rt.import_one_detail(
+                conn, dest, store_base=UPLOAD_DIR)
+            if result in ("dup", "empty"):
+                dest.unlink(missing_ok=True)  # 未产生新引用，不保留重复副本
+        except Exception as exc:
+            result, detail = "error", f"导入异常：{exc}"
+        if result == "error":
+            counts["errors"] += 1
+        elif result in counts:
+            counts[result] += 1
+        _batch_item(conn, batch_id, p.name, result, detail)
+    _batch_finish(conn, batch_id, counts)
+    flash(f"导入完成：{_import_summary(counts)}")
+    return redirect(url_for("import_detail", bid=batch_id))
 
 
 @app.post("/import-files")
@@ -568,17 +1264,47 @@ def import_files():
         flash("未选择文件", "error")
         return redirect(url_for("library"))
     conn = db()
-    counts = {"added": 0, "restored": 0, "dup": 0, "empty": 0}
+    counts = {"added": 0, "restored": 0, "dup": 0, "empty": 0, "errors": 0}
+    batch_id = _batch_start(conn, f"上传：{len(files)} 个文件", len(files))
     batch = UPLOAD_DIR / str(int(time.time() * 1000))
     batch.mkdir(parents=True, exist_ok=True)
     for f in files:
         # 保留中文文件名，仅去路径分隔符（secure_filename 会把中文剥光）
         safe = Path(f.filename).name.replace("/", "_").replace("\\", "_")
         dest = batch / safe
-        f.save(dest)
-        counts[rt.import_one(conn, dest)] += 1
-    flash(f"上传导入完成：新增 {counts['added']}，从回收站恢复 {counts['restored']}，重复 {counts['dup']}，无法解析 {counts['empty']}")
-    return redirect(url_for("library"))
+        try:
+            f.save(dest)
+            result, detail, _ = rt.import_one_detail(conn, dest, store_base=UPLOAD_DIR)
+        except Exception as exc:
+            result, detail = "error", f"导入异常：{exc}"
+        if result == "error":
+            counts["errors"] += 1
+        elif result in counts:
+            counts[result] += 1
+        _batch_item(conn, batch_id, f.filename, result, detail)
+    _batch_finish(conn, batch_id, counts)
+    flash(f"上传导入完成：{_import_summary(counts)}")
+    return redirect(url_for("import_detail", bid=batch_id))
+
+
+@app.get("/imports")
+def imports_list():
+    conn = db()
+    batches = conn.execute(
+        "SELECT * FROM import_batches ORDER BY id DESC LIMIT 100").fetchall()
+    return render_template("imports.html", batches=batches, active="library")
+
+
+@app.get("/imports/<int:bid>")
+def import_detail(bid: int):
+    conn = db()
+    batch = conn.execute("SELECT * FROM import_batches WHERE id=?", (bid,)).fetchone()
+    if batch is None:
+        abort(404)
+    items = conn.execute(
+        "SELECT * FROM import_batch_items WHERE batch_id=? ORDER BY id", (bid,)).fetchall()
+    return render_template("import_detail.html", batch=batch, items=items,
+                           active="library")
 
 
 @app.get("/resume/<int:rid>")
@@ -601,7 +1327,7 @@ def resume_detail(rid: int):
     ).fetchall()
     history = [dict(h) | {"detail": json.loads(h["detail"])} for h in history]
 
-    src = Path(row["path"])
+    src = stored_resume_path(row["path"])
     ext = src.suffix.lower()
     file_info = {
         "exists": src.is_file(),
@@ -637,7 +1363,7 @@ def resume_raw(rid: int):
     row = conn.execute("SELECT filename, path FROM resumes WHERE id=?", (rid,)).fetchone()
     if row is None:
         abort(404)
-    src = Path(row["path"])
+    src = stored_resume_path(row["path"])
     if not src.is_file():
         abort(404)
     return send_file(src, as_attachment=request.args.get("download") == "1",
@@ -685,7 +1411,7 @@ def resume_open(rid: int):
     row = conn.execute("SELECT filename, path FROM resumes WHERE id=?", (rid,)).fetchone()
     if row is None:
         abort(404)
-    src = Path(row["path"])
+    src = stored_resume_path(row["path"])
     if not src.is_file():
         flash(f"原文件不存在（可能已被移动或删除）：{src}", "error")
         return redirect(url_for("resume_detail", rid=rid))
@@ -782,10 +1508,105 @@ def _fts_forget(conn, ids: list[int]) -> None:
         pass
 
 
+def resume_file_on_disk(raw: str) -> Path | None:
+    """解析原文件路径；只有落在数据目录 uploads/ 内才视为可管理文件."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    try:
+        resolved = stored_resume_path(raw).resolve()
+        root = UPLOAD_DIR.resolve()
+    except OSError:
+        return None
+    return resolved if resolved.is_relative_to(root) else None
+
+
+def human_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    return f"{size / 1024 / 1024 / 1024:.2f} GB"
+
+
+def _delete_upload_files(raw_paths: list[str], keep_paths: set[str] | None = None) -> tuple[int, int]:
+    """删除数据目录内的原始文件；返回 (已删除, 未处理).
+
+    外部目录导入的历史文件不会被擅自删除，只计入未处理，由用户自行决定。
+    """
+    keep_paths = keep_paths or set()
+    root = UPLOAD_DIR.resolve()
+    deleted = kept = 0
+    touched_dirs: set[Path] = set()
+    for raw in raw_paths:
+        if raw in keep_paths:
+            kept += 1
+            continue
+        path = resume_file_on_disk(raw)
+        if path is None:
+            if str(raw or "").strip():
+                kept += 1
+            continue
+        try:
+            if path.is_file():
+                path.unlink()
+                deleted += 1
+                touched_dirs.add(path.parent)
+            else:
+                kept += 1
+        except OSError as exc:
+            app.logger.warning("删除原文件失败 %s：%s", path, exc)
+            kept += 1
+    # 清掉空的批次目录，避免 uploads/ 里堆大量空文件夹
+    for directory in touched_dirs:
+        try:
+            if directory != root and directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+    return deleted, kept
+
+
+def _purge_message(filename: str, deleted: int, kept: int) -> str:
+    if deleted and kept:
+        return f"已彻底删除「{filename}」，其中 {deleted} 个原始文件已从数据目录移除；{kept} 个文件在数据目录之外，未删除"
+    if deleted:
+        return f"已彻底删除「{filename}」及其原始文件"
+    if kept:
+        return f"已彻底删除「{filename}」及其筛选记录；原始文件不在数据目录，未自动删除"
+    return f"已彻底删除「{filename}」及其筛选记录"
+
+
+def find_orphan_uploads(conn) -> tuple[list[Path], int]:
+    """找出 uploads/ 中没有被任何简历引用的文件（含重复导入留下的副本）."""
+    referenced: set[Path] = set()
+    for (raw,) in conn.execute("SELECT path FROM resumes WHERE path IS NOT NULL"):
+        path = resume_file_on_disk(raw)
+        if path is not None:
+            referenced.add(path)
+    orphans: list[Path] = []
+    total = 0
+    if UPLOAD_DIR.is_dir():
+        for path in UPLOAD_DIR.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve()
+                if resolved in referenced:
+                    continue
+                total += path.stat().st_size
+            except OSError:
+                continue
+            orphans.append(path)
+    return orphans, total
+
+
 @app.post("/trash/<int:rid>/purge")
 def trash_purge(rid: int):
     conn = db()
-    row = conn.execute("SELECT filename FROM resumes WHERE id=? AND deleted_at IS NOT NULL",
+    row = conn.execute("SELECT filename, path FROM resumes WHERE id=? AND deleted_at IS NOT NULL",
                        (rid,)).fetchone()
     if row is None:
         flash("该记录不在回收站中", "error")
@@ -794,28 +1615,58 @@ def trash_purge(rid: int):
     _fts_forget(conn, [rid])
     _drop_orphan_persons(conn)
     conn.commit()
-    flash(f"已彻底删除「{row['filename']}」及其筛选记录（磁盘文件保留）")
+    remaining = {r[0] for r in conn.execute("SELECT path FROM resumes WHERE path IS NOT NULL")}
+    deleted, kept = _delete_upload_files([row["path"]], keep_paths=remaining)
+    flash(_purge_message(row["filename"], deleted, kept))
     return redirect(url_for("trash"))
 
 
 @app.post("/trash/empty")
 def trash_empty():
     conn = db()
-    rows = conn.execute("SELECT id FROM resumes WHERE deleted_at IS NOT NULL").fetchall()
+    rows = conn.execute("SELECT id, path FROM resumes WHERE deleted_at IS NOT NULL").fetchall()
     ids = [r["id"] for r in rows]
+    paths = [r["path"] for r in rows]
     conn.execute("DELETE FROM resumes WHERE deleted_at IS NOT NULL")
     _fts_forget(conn, ids)
     _drop_orphan_persons(conn)
     conn.commit()
-    flash(f"回收站已清空，彻底删除 {len(ids)} 份简历（磁盘文件保留）")
+    remaining = {r[0] for r in conn.execute("SELECT path FROM resumes WHERE path IS NOT NULL")}
+    deleted, kept = _delete_upload_files(paths, keep_paths=remaining)
+    msg = f"回收站已清空，彻底删除 {len(ids)} 份简历"
+    if deleted:
+        msg += f"，同时移除 {deleted} 个原始文件"
+    if kept:
+        msg += f"；{kept} 个原文件不在数据目录，未自动删除"
+    flash(msg)
     return redirect(url_for("trash"))
 
 
 @app.get("/export")
 def export_csv():
-    out = BASE / "report.csv"
-    rt.cmd_export(SimpleNamespace(db=DB, out=str(out)))
-    return send_file(out, as_attachment=True, download_name="resume_report.csv")
+    """导出 CSV：沿用当前搜索/模板口径，不再静默导出全库."""
+    conn = db()
+    q = request.args.get("q", "").strip()
+    tpl_arg = request.args.get("template", "all")
+    tpl_label = tpl_name(tpl_arg) if (
+        tpl_arg != "all" and template_path(tpl_arg) is not None) else None
+    picked = parse_selected_ids(request.args.getlist("ids"))
+    if picked:
+        ids = picked
+    elif q:
+        ids = rt.search_ids(conn, q)
+    else:
+        ids = None
+    try:
+        report = rt.build_report_csv(conn, ids, template=tpl_label)
+    except ValueError as exc:
+        flash(f"无法导出 CSV：{exc}", "error")
+        return redirect(url_for("library", q=q or None, template=tpl_arg))
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    buf = io.BytesIO(report.encode("utf-8-sig"))
+    return send_file(buf, as_attachment=True,
+                     download_name=f"resume_report-{stamp}.csv",
+                     mimetype="text/csv")
 
 
 # ---------- 路由：候选人（同人多版本聚合） ----------
@@ -931,9 +1782,9 @@ def export_xlsx():
     conn = db()
     q = request.args.get("q", "").strip()
     tpl_arg = request.args.get("template", "all")
-    tpl_label = tpl_name(tpl_arg) if (tpl_arg != "all" and (TPL_DIR / f"{tpl_arg}.json").is_file()) else None
-    ids_raw = ",".join(request.args.getlist("ids")) + "," + request.args.get("ids", "")
-    picked = [int(x) for x in re.split(r"[,\s]+", ids_raw) if x.isdigit()]
+    tpl_label = tpl_name(tpl_arg) if (
+        tpl_arg != "all" and template_path(tpl_arg) is not None) else None
+    picked = parse_selected_ids(request.args.getlist("ids"))
 
     if picked:
         ids = picked
@@ -942,6 +1793,7 @@ def export_xlsx():
     else:
         ids = [r["id"] for r in conn.execute(
             "SELECT id FROM resumes WHERE deleted_at IS NULL ORDER BY id DESC").fetchall()]
+    ids = list(dict.fromkeys(ids))
     if not ids:
         flash("没有可导出的简历", "error")
         return redirect(url_for("library"))
@@ -1041,6 +1893,11 @@ def export_xlsx():
 @app.get("/screen")
 def screen():
     slugs = parse_slugs(request.args.get("templates", ""))
+    remembered = False
+    if not slugs:
+        # 没有显式指定模板时，恢复上次的选择，避免每次重新勾选
+        slugs = get_screen_templates()
+        remembered = bool(slugs)
     templates = list_templates()
     conn = db()
     results_by_tpl = []
@@ -1093,24 +1950,36 @@ def screen():
                     "pct": min(pct, 100), "current": job.get("current", ""),
                     "message": job.get("message", ""), "errors": job.get("errors", [])}
 
-    _, provider = provider_status()
+    _, provider, _ = provider_status()
     tpl_meta = [{"slug": t["slug"], "name": t["name"], "department": t["department"],
                  "role": t["role"], "required": t["required"], "skills": t["skills"]}
                 for t in templates]
     return render_template("screen.html", templates=templates, engines=ENGINES,
                            results_by_tpl=results_by_tpl, slugs=slugs, resumes=resumes,
                            favorites=get_favorites(), tpl_meta=tpl_meta,
+                           remembered=remembered, saved_templates=get_screen_templates(),
                            resume_total=len(resumes),
                            ai_ready=provider is not None, job=job_view, active="screen")
 
 
+@app.post("/screen/templates")
+def screen_templates_save():
+    """前端勾选变化时即时记住，未运行筛选也能在下次打开时恢复."""
+    raw = ",".join(request.form.getlist("templates")) or request.form.get("templates", "")
+    return {"ok": True, "templates": save_screen_templates(parse_slugs(raw))}
+
+
 @app.post("/screen/run")
 def screen_run():
-    slugs = [s for s in request.form.getlist("templates") if s]
+    slugs = parse_slugs(",".join(request.form.getlist("templates")))
     engine = request.form.get("engine", "keyword")
+    if engine not in ENGINES:
+        engine = "keyword"
     scope = request.form.get("scope", "all")
+    if scope not in ("all", "unscreened", "selected"):
+        scope = "all"
     ids_raw = request.form.get("ids", "").strip()
-    ids = [int(x) for x in re.split(r"[,\s]+", ids_raw) if x.isdigit()] if ids_raw else None
+    ids = parse_selected_ids([ids_raw]) or None
     if not slugs:
         flash("请至少勾选一个筛选模板", "error")
         return redirect(url_for("screen"))
@@ -1118,6 +1987,7 @@ def screen_run():
         flash("已选择「指定简历」但未勾选任何简历，请重新选择范围", "error")
         return redirect(url_for("screen", templates=",".join(slugs)))
 
+    save_screen_templates(slugs)  # 开始筛选即记住本次选择
     if engine in ("ai", "funnel") and len(slugs) > 1:
         flash(f"注意：AI 引擎将按「模板 × 简历」组合逐份调用，共 {len(slugs)} 个模板，请留意 API 用量")
     jid = start_job(engine, slugs, ids, scope)  # 立即返回，进度在页面轮询
@@ -1149,8 +2019,8 @@ def templates_page():
 
 @app.get("/templates/<slug>")
 def template_edit(slug: str):
-    path = TPL_DIR / f"{slug}.json"
-    if not path.is_file():
+    path = template_path(slug)
+    if path is None:
         abort(404)
     content = path.read_text(encoding="utf-8")
     try:
@@ -1163,7 +2033,8 @@ def template_edit(slug: str):
 
 @app.post("/templates/<slug>")
 def template_save(slug: str):
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug):
+    dest = template_dest(slug)
+    if dest is None:
         flash("模板文件名只允许小写字母/数字/连字符", "error")
         return redirect(url_for("templates_page"))
     content = request.form.get("content", "")
@@ -1171,7 +2042,7 @@ def template_save(slug: str):
     tmp.write_text(content, encoding="utf-8")
     try:
         rt.load_template(tmp)  # 校验 JSON 结构、必备技能引用等
-    except SystemExit as exc:
+    except (SystemExit, Exception) as exc:
         flash(f"校验失败，未保存：{exc}", "error")
         tmp.unlink(missing_ok=True)
         try:
@@ -1180,7 +2051,7 @@ def template_save(slug: str):
             raw = None
         return render_template("template_edit.html", slug=slug, content=content,
                                raw=raw, active="templates")
-    tmp.replace(TPL_DIR / f"{slug}.json")
+    tmp.replace(dest)
     flash("模板已保存并通过校验")
     return redirect(url_for("template_edit", slug=slug))
 
@@ -1250,8 +2121,8 @@ def template_import():
 
 @app.get("/templates/<slug>/export")
 def template_export(slug: str):
-    path = TPL_DIR / f"{slug}.json"
-    if not path.is_file():
+    path = template_path(slug)
+    if path is None:
         abort(404)
     return send_file(path, as_attachment=True, download_name=f"{slug}.json",
                      mimetype="application/json")
@@ -1403,7 +2274,7 @@ def changelog():
 @app.post("/templates/<slug>/favorite")
 def template_favorite(slug: str):
     """收藏/取消收藏模板（存 config/app_settings.json，跨浏览器有效）."""
-    if not (TPL_DIR / f"{slug}.json").is_file():
+    if template_path(slug) is None:
         return {"ok": False, "error": "模板不存在"}, 404
     on = toggle_favorite(slug)
     return {"ok": True, "slug": slug, "favorite": on, "favorites": get_favorites()}
@@ -1413,20 +2284,230 @@ def template_favorite(slug: str):
 
 @app.get("/settings")
 def settings():
-    providers, active = provider_status()
+    providers, active, provider_error = provider_status()
+    orphans, orphan_bytes = find_orphan_uploads(db())
     return render_template("settings.html", providers=providers,
-                           active_provider=active, current_version=current_version(),
+                           active_provider=active, provider_error=provider_error,
+                           current_version=current_version(),
+                           backups=list_backups(),
+                           orphan_count=len(orphans),
+                           orphan_size=human_size(orphan_bytes),
+                           log_file=str(LOG_FILE),
                            active="settings")
+
+
+@app.post("/settings/backup/create")
+def settings_backup_create():
+    include_uploads = request.form.get("include_uploads") == "on"
+    try:
+        path = create_backup("manual", include_uploads=include_uploads)
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+        flash(f"备份失败：{exc}", "error")
+    else:
+        size = round(path.stat().st_size / 1024 / 1024, 1)
+        flash(f"备份已生成：{path.name}（{size} MB）", "message")
+    return redirect(url_for("settings", _anchor="backup"))
+
+
+@app.get("/settings/backups/<name>")
+def settings_backup_download(name: str):
+    path = backup_file(name)
+    if path is None:
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=path.name,
+                     mimetype="application/zip")
+
+
+def _diagnostic_summary(conn) -> dict:
+    """诊断摘要：只统计规模与环境，不读取简历正文."""
+    def scalar(sql: str, default=0):
+        try:
+            row = conn.execute(sql).fetchone()
+            return row[0] if row and row[0] is not None else default
+        except sqlite3.DatabaseError:
+            return default
+
+    db_path = Path(DB)
+    uploads, upload_bytes = find_orphan_uploads(conn)
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "app_version": current_version(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "data_dir": str(DATA_DIR),
+        "db_file": db_path.name,
+        "db_bytes": db_path.stat().st_size if db_path.is_file() else 0,
+        "counts": {
+            "resumes": scalar("SELECT COUNT(*) FROM resumes WHERE deleted_at IS NULL"),
+            "trash": scalar("SELECT COUNT(*) FROM resumes WHERE deleted_at IS NOT NULL"),
+            "persons": scalar("SELECT COUNT(*) FROM persons"),
+            "screenings": scalar("SELECT COUNT(*) FROM screenings"),
+            "import_batches": scalar("SELECT COUNT(*) FROM import_batches"),
+            "templates": len(list(TPL_DIR.glob("*.json"))) if TPL_DIR.is_dir() else 0,
+        },
+        "uploads": {
+            "orphan_files": len(uploads),
+            "orphan_bytes": upload_bytes,
+            "backup_files": len(list_backups()),
+        },
+    }
+
+
+def _redacted_providers() -> dict:
+    """厂商配置去掉 Key，只保留是否已配置，便于排查又不泄露凭据."""
+    try:
+        data = json.loads(PROVIDERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"error": "配置文件缺失或无法解析"}
+    out = {"active": data.get("active", ""), "providers": {}}
+    for name, spec in (data.get("providers") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        out["providers"][name] = {
+            "label": spec.get("label", ""),
+            "base_url": spec.get("base_url", ""),
+            "model": spec.get("model", ""),
+            "api_key_configured": bool(str(spec.get("api_key", "")).strip()),
+        }
+    return out
+
+
+@app.get("/settings/diagnostics")
+def settings_diagnostics():
+    """导出诊断包：环境、统计、脱敏配置和运行日志，默认不含简历正文与 API Key."""
+    conn = db()
+    summary = _diagnostic_summary(conn)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+        zf.writestr("config/providers.redacted.json",
+                    json.dumps(_redacted_providers(), ensure_ascii=False, indent=2))
+        if APP_SETTINGS_PATH.is_file():
+            zf.writestr("config/app_settings.json",
+                        APP_SETTINGS_PATH.read_text(encoding="utf-8"))
+        logs = sorted(LOG_DIR.glob("resume-tool.log*"))[-3:] if LOG_DIR.is_dir() else []
+        for path in logs:
+            try:
+                zf.write(path, f"logs/{path.name}")
+            except OSError:
+                continue
+        zf.writestr(
+            "README.txt",
+            "简历工具诊断包\n"
+            f"生成时间：{summary['generated_at']}\n"
+            f"应用版本：{summary['app_version']}\n\n"
+            "包含：环境与数据规模统计、脱敏后的 AI 配置、最近运行日志。\n"
+            "不包含：简历正文、候选人个人信息、API Key、数据库文件。\n"
+            "如需进一步排查，可另行提供备份文件（备份含个人信息，请走受控渠道）。\n",
+        )
+    buffer.seek(0)
+    name = f"resume-tool-diagnostics-{datetime.now():%Y%m%d-%H%M}.zip"
+    app.logger.info("已导出诊断包：%s", name)
+    return send_file(buffer, as_attachment=True, download_name=name,
+                     mimetype="application/zip")
+
+
+@app.post("/settings/uploads/clean")
+def settings_uploads_clean():
+    """清理 uploads/ 中没有任何简历引用的文件（重复导入副本、失败上传残留）."""
+    conn = db()
+    orphans, total = find_orphan_uploads(conn)
+    if not orphans:
+        flash("没有需要清理的孤立文件")
+        return redirect(url_for("settings", _anchor="diagnostics"))
+    removed = 0
+    touched: set[Path] = set()
+    root = UPLOAD_DIR.resolve()
+    for path in orphans:
+        try:
+            path.unlink()
+            removed += 1
+            touched.add(path.parent)
+        except OSError as exc:
+            app.logger.warning("清理孤立文件失败 %s：%s", path, exc)
+    for directory in touched:
+        try:
+            if directory != root and directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+    app.logger.info("清理孤立文件 %s 个，释放 %s 字节", removed, total)
+    flash(f"已清理 {removed} 个孤立文件，释放约 {human_size(total)}")
+    return redirect(url_for("settings", _anchor="diagnostics"))
+
+
+@app.post("/settings/backups/<name>/restore")
+def settings_backup_restore_existing(name: str):
+    path = backup_file(name)
+    if path is None:
+        abort(404)
+    try:
+        result = restore_backup(path)
+    except (OSError, ValueError, zipfile.BadZipFile, sqlite3.DatabaseError) as exc:
+        flash(f"恢复失败，原数据未改变：{exc}", "error")
+    else:
+        before = (f"恢复前数据备份为 {result['pre_backup']}"
+                  if result["pre_backup"] else "目标是空数据目录，未生成恢复前备份")
+        flash(f"已从 {name} 恢复；{before}", "message")
+    return redirect(url_for("settings", _anchor="backup"))
+
+
+@app.post("/settings/restore")
+def settings_restore():
+    upload = request.files.get("backup")
+    if upload is None or not upload.filename:
+        flash("请选择要恢复的备份文件（.zip 或 .db）", "error")
+        return redirect(url_for("settings", _anchor="backup"))
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in (".zip", ".db"):
+        flash("备份格式不支持，请选择本应用生成的 .zip 或 .db 文件", "error")
+        return redirect(url_for("settings", _anchor="backup"))
+    try:
+        with tempfile.TemporaryDirectory(prefix="resume-tool-upload-") as td:
+            archive = Path(td) / f"restore{suffix}"
+            upload.save(archive)
+            result = restore_backup(archive)
+    except (OSError, ValueError, zipfile.BadZipFile, sqlite3.DatabaseError) as exc:
+        flash(f"恢复失败，原数据未改变：{exc}", "error")
+    else:
+        msg = (f"恢复完成；恢复前数据已备份为 {result['pre_backup']}"
+               if result["pre_backup"] else "恢复完成；目标是空数据目录，未生成恢复前备份")
+        if result["uploads"]:
+            msg += f"，同时恢复了 {result['uploads']} 个原始文件"
+        flash(msg, "message")
+    return redirect(url_for("settings", _anchor="backup"))
+
+
+@app.get("/settings/update-status")
+def settings_update_status():
+    return get_update_status()
 
 
 @app.get("/settings/check-update")
 def settings_check_update():
-    return check_for_update()
+    start_update_check()
+    return get_update_status()
 
 
 @app.post("/settings")
 def settings_save():
-    data = rt.load_providers(PROVIDERS_PATH)
+    try:
+        data = rt.ensure_providers(PROVIDERS_PATH)
+        repaired = ""
+    except (OSError, rt.ProviderConfigError) as exc:
+        # 原配置损坏时先保留取证副本，再用缺省结构接收本次表单，避免把修复入口锁死。
+        backup = ""
+        try:
+            if PROVIDERS_PATH.is_file():
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                broken = PROVIDERS_PATH.with_name(f"providers.broken-{stamp}.json")
+                shutil.copy2(PROVIDERS_PATH, broken)
+                backup = f"，原文件已备份为 {broken.name}"
+        except OSError:
+            pass
+        data = rt.default_providers()
+        repaired = f"原配置无法读取（{exc}）{backup}，已用缺省配置重建。"
+
     data["active"] = request.form.get("active", data.get("active", ""))
     for name, spec in data.get("providers", {}).items():
         for field in ("label", "base_url", "model"):
@@ -1434,8 +2515,8 @@ def settings_save():
         key = request.form.get(f"{name}__api_key", "").strip()
         if key:  # 留空表示不修改已保存的 Key
             spec["api_key"] = key
-    PROVIDERS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    flash("AI 厂商配置已保存")
+    rt.write_providers(PROVIDERS_PATH, data)
+    flash(repaired + "AI 厂商配置已保存", "error" if repaired else "message")
     return redirect(url_for("settings"))
 
 
@@ -1445,13 +2526,38 @@ def settings_preview():
     method = request.form.get("preview_method", "default")
     cfg["preview_method"] = method if method in OPEN_METHODS else "default"
     cfg["cloud_url"] = request.form.get("cloud_url", cfg.get("cloud_url", "")).strip()
-    cfg["update_url"] = request.form.get("update_url", cfg.get("update_url", "")).strip()
+    cfg.pop("update_url", None)  # 旧版自定义清单地址已由固定 GitHub Release 源取代
     cfg["auto_check_updates"] = request.form.get("auto_check_updates") == "on"
+    cfg["auto_backup"] = request.form.get("auto_backup") == "on"
     save_app_settings(cfg)
     flash("通用设置已保存")
     return redirect(url_for("settings"))
 
 
-if __name__ == "__main__":
+def main() -> None:
+    configure_logging()
+    app.logger.info("启动简历工具 %s；数据目录 %s", current_version(), DATA_DIR)
+    cfg = load_app_settings()
+    try:
+        conn = rt.get_conn(DB)
+        try:
+            normalize_upload_paths(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.DatabaseError) as exc:
+        app.logger.warning("简历路径迁移失败：%s", exc)
+    if cfg.get("auto_check_updates", True):
+        start_update_check()
+    if cfg.get("auto_backup", True):
+        try:
+            backup = maybe_auto_backup()
+            if backup:
+                app.logger.info("已生成每日自动备份：%s", backup.name)
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+            app.logger.warning("自动备份失败，不影响应用启动：%s", exc)
     # 单机桌面用途：只绑定回环地址，关闭 reloader（打包 exe 的硬性要求）
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

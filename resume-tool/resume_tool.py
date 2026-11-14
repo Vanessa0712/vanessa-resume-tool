@@ -34,6 +34,7 @@ import argparse
 import csv
 import hashlib
 import html as html_mod
+import io
 import json
 import re
 import sqlite3
@@ -339,20 +340,70 @@ AI_SYSTEM_PROMPT = (
 )
 
 
-def load_providers(path: Path) -> dict:
-    """读取 AI 厂商配置；文件不存在时给出可操作指引."""
+class ProviderConfigError(ValueError):
+    """AI 厂商配置缺失或格式错误；Web 层应展示提示而不是退出进程."""
+
+
+def default_providers() -> dict:
+    return {
+        "active": "deepseek",
+        "providers": {
+            "deepseek": {
+                "label": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+                "api_key": "", "model": "deepseek-chat",
+            },
+            "moonshot": {
+                "label": "Moonshot Kimi", "base_url": "https://api.moonshot.cn/v1",
+                "api_key": "", "model": "moonshot-v1-8k",
+            },
+            "custom": {
+                "label": "自定义(OpenAI兼容)", "base_url": "", "api_key": "", "model": "",
+            },
+        },
+    }
+
+
+def read_providers(path: Path) -> dict:
+    """严格读取配置；失败抛 ProviderConfigError，由调用方决定退出或降级."""
     if not path.is_file():
-        sys.exit(
-            f"[配置错误] 找不到 {path}\n"
-            "请创建该文件，示例结构：\n"
-            '{"active": "deepseek", "providers": {"deepseek": '
-            '{"label": "DeepSeek", "base_url": "https://api.deepseek.com/v1", '
-            '"api_key": "你的Key", "model": "deepseek-chat"}}}'
-        )
+        raise ProviderConfigError(f"找不到 AI 配置文件：{path}")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        sys.exit(f"[配置错误] providers JSON 解析失败: {exc}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProviderConfigError(f"AI 配置文件无法解析：{exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
+        raise ProviderConfigError("AI 配置文件缺少 providers 对象")
+    if not isinstance(data.get("active", ""), str):
+        raise ProviderConfigError("AI 配置文件的 active 字段必须是字符串")
+    for name, spec in data["providers"].items():
+        if not isinstance(spec, dict):
+            raise ProviderConfigError(f"AI 厂商 {name} 的配置必须是对象")
+    return data
+
+
+def write_providers(path: Path, data: dict) -> None:
+    """原子写入，避免保存中断留下半截 JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def ensure_providers(path: Path) -> dict:
+    """首次运行时生成可编辑的缺省配置；已有文件保持不变."""
+    if path.is_file():
+        return read_providers(path)
+    data = default_providers()
+    write_providers(path, data)
+    return data
+
+
+def load_providers(path: Path) -> dict:
+    """CLI 入口：读取失败时保持原有可读报错并退出."""
+    try:
+        return read_providers(path)
+    except ProviderConfigError as exc:
+        sys.exit(f"[配置错误] {exc}")
 
 
 def get_active_provider(providers: dict) -> dict | None:
@@ -483,7 +534,8 @@ def agent_export_batch(conn: sqlite3.Connection, tpl: Template, resumes: list) -
         _, name, _, _ = person_info(row["filename"], row["text"])
         items.append({
             "resume_id": int(row["id"]),
-            "filename": row["filename"],
+            # 文件名常包含「姓名-岗位.doc」，必须与正文一起脱敏。
+            "filename": mask_pii(row["filename"], name),
             "text": mask_pii(row["text"], name),
         })
     return {
@@ -566,6 +618,27 @@ CREATE TABLE IF NOT EXISTS screenings(
   detail TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS import_batches(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  total INTEGER NOT NULL DEFAULT 0,
+  added INTEGER NOT NULL DEFAULT 0,
+  restored INTEGER NOT NULL DEFAULT 0,
+  dup INTEGER NOT NULL DEFAULT 0,
+  empty INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS import_batch_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL,
+  result TEXT NOT NULL,
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_batch_items(batch_id);
 """
 
 
@@ -807,45 +880,63 @@ def _fetch_resumes(conn: sqlite3.Connection, ids: list[int] | None = None) -> li
 
 # ============ 命令实现 ============
 
-def import_one(conn: sqlite3.Connection, path: Path) -> str:
-    """导入单份简历（CLI 与 Web UI 共用）.
+def _stored_path(path: Path, store_base: Path | None) -> str:
+    """存在应用 uploads 下的文件存相对路径，外部目录仍保留绝对路径."""
+    resolved = path.resolve()
+    if store_base is not None:
+        try:
+            rel = resolved.relative_to(store_base.resolve())
+        except ValueError:
+            return str(resolved)
+        return (Path(store_base.name) / rel).as_posix()
+    return str(resolved)
 
-    Returns:
-        "added" 新增 / "restored" 命中回收站记录并恢复 / "dup" 内容重复 / "empty" 无法解析文本。
-    """
+
+def import_one_detail(conn: sqlite3.Connection, path: Path,
+                      store_base: Path | None = None) -> tuple[str, str, int | None]:
+    """导入单份简历并返回 (结果, 可展示说明, 简历ID)，供导入批次记录使用."""
     text = extract_text(path)
     if not text.strip():
-        return "empty"
+        return "empty", "未抽取到文本，可能是扫描版 PDF 或旧版 .doc", None
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    stored_path = _stored_path(path, store_base)
 
     # 同一内容已在库中：回收站里的直接恢复，正常记录按重复跳过
     exist = conn.execute(
         "SELECT id, deleted_at FROM resumes WHERE sha256=?", (digest,)
     ).fetchone()
     if exist:
+        rid = int(exist["id"])
         if exist["deleted_at"]:
             pkey, name, phone, email = person_info(path.name, text)
             pid = ensure_person(conn, pkey, name, phone, email)
             conn.execute(
                 "UPDATE resumes SET deleted_at=NULL, path=?, filename=?, imported_at=?,"
                 " person_id=? WHERE id=?",
-                (str(path.resolve()), path.name, now(), pid, exist["id"]),
+                (stored_path, path.name, now(), pid, rid),
             )
-            index_resume(conn, exist["id"], path.name, text)
+            index_resume(conn, rid, path.name, text)
             conn.commit()
-            return "restored"
-        return "dup"
+            return "restored", f"已从回收站恢复为简历 #{rid}", rid
+        return "dup", f"内容已存在，对应简历 #{rid}", rid
 
     pkey, name, phone, email = person_info(path.name, text)
     pid = ensure_person(conn, pkey, name, phone, email)
     cur = conn.execute(
         "INSERT INTO resumes(filename, path, sha256, text, imported_at, person_id)"
         " VALUES(?,?,?,?,?,?)",
-        (path.name, str(path.resolve()), digest, text, now(), pid),
+        (path.name, stored_path, digest, text, now(), pid),
     )
-    index_resume(conn, int(cur.lastrowid), path.name, text)
+    rid = int(cur.lastrowid)
+    index_resume(conn, rid, path.name, text)
     conn.commit()
-    return "added"
+    return "added", f"已导入为简历 #{rid}", rid
+
+
+def import_one(conn: sqlite3.Connection, path: Path,
+               store_base: Path | None = None) -> str:
+    """兼容 CLI 的单值返回：added / restored / dup / empty."""
+    return import_one_detail(conn, path, store_base)[0]
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -968,44 +1059,69 @@ def cmd_screen(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_export(args: argparse.Namespace) -> int:
-    conn = get_conn(args.db)
-    resumes = conn.execute(
-        "SELECT * FROM resumes WHERE deleted_at IS NULL ORDER BY id").fetchall()
+def build_report_csv(conn: sqlite3.Connection, ids: list[int] | None = None,
+                     template: str | None = None) -> str:
+    """生成 CSV 文本；ids 保持传入顺序，template 只取指定模板的最新结果."""
+    wanted = list(dict.fromkeys(ids)) if ids is not None else None
+    rows = conn.execute(
+        "SELECT id, filename FROM resumes WHERE deleted_at IS NULL ORDER BY id").fetchall()
+    if wanted is not None:
+        wanted_set = set(wanted)
+        row_map = {r["id"]: r for r in rows if r["id"] in wanted_set}
+        resumes = [row_map[rid] for rid in wanted if rid in row_map]
+    else:
+        resumes = rows
     if not resumes:
-        sys.exit("[错误] 简历库为空")
-    # 每份简历取每个引擎的最新一次结果
+        raise ValueError("简历库为空" if wanted is None else "所选简历不存在或已删除")
+
+    # 每份简历取每个引擎的最新一次结果；按模板导出时只看该模板口径。
     latest: dict[tuple[int, str], sqlite3.Row] = {}
-    for s in conn.execute("SELECT * FROM screenings ORDER BY created_at, id").fetchall():
+    sql = "SELECT * FROM screenings"
+    params: tuple = ()
+    if template:
+        sql += " WHERE template=?"
+        params = (template,)
+    for s in conn.execute(sql + " ORDER BY created_at, id", params).fetchall():
         latest[(s["resume_id"], s["engine"])] = s
 
     fields = ["ID", "文件", "关键词状态", "关键词分", "关键词结论",
               "AI状态", "AI分", "AI理由", "综合建议"]
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(fields)
+    for row in resumes:
+        kw = latest.get((row["id"], "keyword"))
+        ai = latest.get((row["id"], "ai"))
+        kw_detail = json.loads(kw["detail"]) if kw else {}
+        if ai is not None:
+            suggestion = f"{ai['status']}(AI)"
+        elif kw is None:
+            suggestion = "未筛选"
+        elif kw["status"] == "通过":
+            suggestion = "通过，建议人工复核"
+        elif kw["status"] == "待核实":
+            suggestion = "建议 AI 复核(需配置 API)或人工"
+        else:
+            suggestion = "未通过"
+        writer.writerow([
+            row["id"], row["filename"],
+            kw["status"] if kw else "-", kw["score"] if kw else "-",
+            kw_detail.get("reason", "-") if kw else "-",
+            ai["status"] if ai else "-", ai["score"] if ai else "-",
+            json.loads(ai["detail"]).get("reason", "") if ai else "-",
+            suggestion,
+        ])
+    return buf.getvalue()
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    conn = get_conn(args.db)
+    try:
+        report = build_report_csv(conn)
+    except ValueError as exc:
+        sys.exit(f"[错误] {exc}")
     with open(args.out, "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(fields)
-        for row in resumes:
-            kw = latest.get((row["id"], "keyword"))
-            ai = latest.get((row["id"], "ai"))
-            kw_detail = json.loads(kw["detail"]) if kw else {}
-            if ai is not None:
-                suggestion = f"{ai['status']}(AI)"
-            elif kw is None:
-                suggestion = "未筛选"
-            elif kw["status"] == "通过":
-                suggestion = "通过，建议人工复核"
-            elif kw["status"] == "待核实":
-                suggestion = "建议 AI 复核(需配置 API)或人工"
-            else:
-                suggestion = "未通过"
-            writer.writerow([
-                row["id"], row["filename"],
-                kw["status"] if kw else "-", kw["score"] if kw else "-",
-                kw_detail.get("reason", "-") if kw else "-",
-                ai["status"] if ai else "-", ai["score"] if ai else "-",
-                json.loads(ai["detail"]).get("reason", "") if ai else "-",
-                suggestion,
-            ])
+        fh.write(report)
     print(f"[导出完成] {Path(args.out).resolve()}")
     return 0
 

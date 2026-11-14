@@ -241,3 +241,63 @@ a.ver-bubble:hover { background: #f3e4c6; border-color: #e2c88f; }
 .donut-legend i { border-radius: 3px; }
 .tabs .tab.active { color: var(--primary-hover); border-color: var(--primary); }
 .skill-row, .kv, .meta-grid { border-color: var(--border); }
+
+/* ---------- 设置：数据备份 ---------- */
+.backup-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px; margin-top: 16px;
+}
+.backup-panel {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 18px; border: 1px solid var(--border); border-radius: 14px;
+  background: var(--surface-alt);
+}
+.backup-panel-title {
+  font-family: "RT Serif", "Noto Serif SC", serif;
+  font-size: 15px; font-weight: 600; color: var(--text);
+  margin-bottom: 5px;
+}
+.backup-panel .hint { margin: 0; line-height: 1.55; }
+.backup-check { align-items: flex-start; line-height: 1.5; }
+.backup-check input { flex: 0 0 auto; margin-top: 2px; }
+.backup-file-label {
+  display: block; font-size: 12px; font-weight: 600;
+  color: var(--text-secondary);
+}
+.backup-file {
+  width: 100%; padding: 8px 10px; cursor: pointer;
+  border: 1px dashed var(--border-strong); border-radius: 10px;
+  background: var(--surface); color: var(--text-secondary); font-size: 12px;
+}
+.backup-file::file-selector-button {
+  margin-right: 10px; padding: 6px 12px; cursor: pointer;
+  border: 1px solid var(--border-strong); border-radius: 999px;
+  background: var(--surface-alt); color: var(--text-secondary);
+  font: inherit;
+}
+.backup-actions { display: flex; margin-top: auto; }
+.backup-path {
+  margin: 10px 0 0; padding: 8px 10px;
+  border-radius: 8px; background: var(--panel);
+  font-size: 12px; color: var(--text-secondary);
+}
+.backup-path code {
+  overflow-wrap: anywhere; font-family: ui-monospace, Consolas, monospace;
+}
+.backup-history-head {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--border);
+}
+.backup-history-head .card-title { margin: 0; }
+.backup-table .backup-name {
+  max-width: 300px; overflow-wrap: anywhere;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px; color: var(--text-secondary);
+}
+.backup-row-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.backup-row-actions form { display: inline; }
+.backup-empty { margin-top: 16px; }
+@media (max-width: 900px) {
+  .backup-grid { grid-template-columns: 1fr; }
+}
+

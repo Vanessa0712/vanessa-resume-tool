@@ -41,7 +41,13 @@
     <a class="page-btn" href="{{ url_for(endpoint, page=page + 1, **args) }}{{ anchor }}">下一页</a>
     {% else %}<span class="page-btn disabled">下一页</span>{% endif %}
 
-    <form method="get" action="{{ url_for(endpoint, **args) }}" class="pager-jump">
+    {# action 用当前路径，保留 /resume/<id> 等动态路由参数；其余筛选条件放隐藏字段 #}
+    <form method="get" action="{{ request.path }}" class="pager-jump">
+      {% for key, value in args.items() %}
+      {% if key not in (request.view_args or {}) %}
+      <input type="hidden" name="{{ key }}" value="{{ value }}">
+      {% endif %}
+      {% endfor %}
       <input type="number" name="page" min="1" max="{{ pages }}" placeholder="页码" required>
       <button class="btn btn-xs" type="submit">跳转</button>
     </form>

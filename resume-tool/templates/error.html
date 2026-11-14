@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ title }}</h1>
+    <p class="subtitle">{{ message }}</p>
+  </div>
+</div>
+<div class="card">
+  <p>错误代码：<span class="badge badge-review">{{ code }}</span>
+    {% if trace_id %}<span class="muted">错误编号：<code>{{ trace_id }}</code></span>{% endif %}
+  </p>
+  {% if trace_id %}
+  <p class="hint">错误编号已写入运行日志。如需请人协助排查，可在「设置 → 运行诊断」导出诊断包，把编号一起提供；诊断包默认不包含简历正文和 API Key。</p>
+  {% endif %}
+  <p class="hint">如果问题反复出现，请先返回简历库确认数据仍在，再重启应用；不要直接删除 <code>resume_tool.db</code>。</p>
+  <div class="head-actions">
+    <a class="btn btn-primary" href="{{ url_for('library') }}">返回简历库</a>
+    <a class="btn btn-secondary" href="{{ url_for('settings') }}">打开设置</a>
+  </div>
+</div>
+{% endblock %}

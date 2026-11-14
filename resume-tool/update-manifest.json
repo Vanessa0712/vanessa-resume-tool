@@ -1,12 +1,12 @@
 {
-  "version": "ver1.2.0",
+  "version": "ver1.2.3",
   "channel": "Beta",
   "date": "2026-11-14",
-  "title": "综合设置与 WorkBuddy Agent 协作筛选",
+  "title": "筛选中心记住模板选择",
   "notes": [
-    "侧边栏 AI 设置升级为综合设置，新增版本更新检查",
-    "新增 Agent 协作筛选：脱敏批次导出、会话内评估、结果写回",
-    "配套 resume-tool-agent 技能，可用一句话触发完整筛选流程"
+    "筛选中心勾选的模板会自动记住，重启程序后自动恢复，无需反复重选",
+    "勾选变化即时保存，未运行筛选也会记住；模板删除后自动失效",
+    "应用设置改为原子写入，避免异常退出损坏配置"
   ],
-  "download_url": ""
+  "download_url": "https://github.com/Vanessa0712/vanessa-resume-tool/releases"
 }

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}导入批次 #{{ batch.id }}{% endblock %}
+{% block content %}
+{% set labels = {'added': '新增', 'restored': '从回收站恢复', 'dup': '重复跳过',
+                 'empty': '无法解析', 'error': '导入异常'} %}
+<div class="page-head">
+  <div>
+    <h1>导入批次 #{{ batch.id }}</h1>
+    <p class="subtitle">{{ batch.source }} · {{ batch.created_at.replace('T', ' ') }}</p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('imports_list') }}">全部导入记录</a>
+    <a class="btn btn-primary" href="{{ url_for('library') }}">返回简历库</a>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-num">{{ batch.total }}</div><div class="stat-label">文件总数</div></div>
+  <div class="stat-card"><div class="stat-num text-pass">{{ batch.added }}</div><div class="stat-label">新增</div></div>
+  <div class="stat-card"><div class="stat-num">{{ batch.restored }}</div><div class="stat-label">从回收站恢复</div></div>
+  <div class="stat-card"><div class="stat-num text-muted">{{ batch.dup }}</div><div class="stat-label">重复跳过</div></div>
+  <div class="stat-card"><div class="stat-num text-fail">{{ batch.empty + batch.errors }}</div><div class="stat-label">失败</div></div>
+</div>
+
+<div class="card">
+  <div class="card-title">逐文件结果</div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>文件</th><th>结果</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td>{{ item.filename }}</td>
+          <td>
+            {% if item.result in ('empty', 'error') %}
+              <span class="badge badge-fail">{{ labels.get(item.result, item.result) }}</span>
+            {% elif item.result == 'added' %}
+              <span class="badge badge-pass">{{ labels.get(item.result, item.result) }}</span>
+            {% else %}
+              <span class="badge badge-review">{{ labels.get(item.result, item.result) }}</span>
+            {% endif %}
+          </td>
+          <td class="muted">{{ item.detail or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if not items %}<div class="empty">这个批次没有文件记录</div>{% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}导入记录{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>导入记录</h1>
+    <p class="subtitle">每次目录或上传导入都会留档，便于核对哪些文件没有成功进入简历库</p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+  </div>
+</div>
+
+<div class="card">
+  {% if batches %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr><th>批次</th><th>时间</th><th>来源</th><th>总数</th><th>新增</th><th>恢复</th>
+            <th>重复</th><th>失败</th><th class="th-actions">操作</th></tr>
+      </thead>
+      <tbody>
+        {% for b in batches %}
+        <tr>
+          <td class="muted">#{{ b.id }}</td>
+          <td class="muted">{{ b.created_at.replace('T', ' ') }}</td>
+          <td>{{ b.source }}</td>
+          <td>{{ b.total }}</td>
+          <td class="text-pass">{{ b.added }}</td>
+          <td>{{ b.restored }}</td>
+          <td class="muted">{{ b.dup }}</td>
+          <td class="{{ 'text-fail' if (b.empty + b.errors) else 'muted' }}">{{ b.empty + b.errors }}</td>
+          <td><a class="btn btn-xs" href="{{ url_for('import_detail', bid=b.id) }}">查看明细</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">还没有导入记录。回到简历库导入一批文件后，这里会显示逐文件结果。</div>
+  {% endif %}
+</div>
+{% endblock %}

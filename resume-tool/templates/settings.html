@@ -14,12 +14,11 @@
     <span class="muted">Beta</span>
     <a href="{{ url_for('changelog') }}">查看更新日志</a>
   </p>
-  <p class="hint">更新由维护者发布到下方「更新清单地址」；发现新版本后，这里会显示更新说明和安装包下载入口。</p>
+  <p class="hint">更新源固定为 <a href="https://github.com/Vanessa0712/vanessa-resume-tool/releases" target="_blank" rel="noopener">GitHub 最新正式 Release</a>；启动自检完成后，这里会显示结果。点击按钮可随时重新检查。</p>
   <button class="btn btn-primary" type="button" id="check-update-btn"
-          data-url="{{ url_for('settings_check_update') }}">检查更新</button>
-  <div id="update-result" class="hint"
-       data-auto="{{ '1' if app_settings.auto_check_updates else '0' }}"
-       style="margin-top:12px">尚未检查</div>
+          data-url="{{ url_for('settings_check_update') }}"
+          data-status-url="{{ url_for('settings_update_status') }}">检查更新</button>
+  <div id="update-result" class="hint" style="margin-top:12px">正在读取更新状态…</div>
 </div>
 
 <div class="card" id="general">
@@ -40,24 +39,134 @@
                placeholder="https://docs.qq.com/desktop">
       </div>
       <div class="field">
-        <label>更新清单地址</label>
-        <input type="text" name="update_url" value="{{ app_settings.update_url }}"
-               placeholder="https://your-server.example.com/resume-tool/update-manifest.json">
-      </div>
-      <div class="field">
         <label>更新偏好</label>
         <label><input type="checkbox" name="auto_check_updates"
-               {{ 'checked' if app_settings.auto_check_updates }}> 打开设置页时自动检查更新</label>
+               {{ 'checked' if app_settings.auto_check_updates }}> 每次启动应用时自动检查更新</label>
+      </div>
+      <div class="field">
+        <label>备份偏好</label>
+        <label><input type="checkbox" name="auto_backup"
+               {{ 'checked' if app_settings.auto_backup }}> 每天首次启动时自动备份数据库和配置</label>
       </div>
     </div>
-    <p class="hint">更新清单留空时读取项目根目录的 update-manifest.json（便于离线测试）；分发版本请填写固定的 HTTPS 地址</p>
+    <p class="hint">启动检查在后台进行，失败不影响使用；GitHub latest 只返回正式 Release，不含草稿和预发布版本</p>
     <p class="hint">「用此方式打开」会以本机程序打开简历原文件；云文档方式仅复制文件路径并打开该网址，不会自动上传</p>
     <button class="btn btn-primary" type="submit">保存通用设置</button>
   </form>
 </div>
 
+<div class="card" id="backup">
+  <div class="card-title">数据备份与恢复</div>
+  <p class="dataflow-note">
+    <b>备份包含：</b>简历库数据库、AI 配置、筛选模板。备份文件未加密，内含候选人个人信息，请存放在受控目录或公司网盘，不要通过公共聊天工具传播。
+  </p>
+  <p class="hint">备份使用 SQLite 一致性快照，不会因为应用正在运行而得到损坏文件；恢复前会自动再备份当前数据。</p>
+  <p class="backup-path"><b>数据目录：</b><code>{{ data_dir }}</code></p>
+
+  <div class="backup-grid">
+    <form class="backup-panel" method="post" action="{{ url_for('settings_backup_create') }}">
+      <div>
+        <div class="backup-panel-title">创建新备份</div>
+        <p class="hint">保存当前数据库与配置；勾选后可连同原始简历文件一起打包。</p>
+      </div>
+      <label class="check-row backup-check">
+        <input type="checkbox" name="include_uploads">
+        <span>同时打包原始简历文件（备份体积更大）</span>
+      </label>
+      <div class="backup-actions">
+        <button class="btn btn-primary" type="submit">立即备份</button>
+      </div>
+    </form>
+
+    <form class="backup-panel" method="post" action="{{ url_for('settings_restore') }}"
+          enctype="multipart/form-data"
+          onsubmit="return confirm('恢复备份会覆盖当前简历库和配置。系统会先自动备份当前数据，是否继续？')">
+      <div>
+        <div class="backup-panel-title">从文件恢复</div>
+        <p class="hint">选择本应用生成的 .zip 或 .db 备份；恢复前会自动保留当前数据。</p>
+      </div>
+      <label class="backup-file-label" for="backup-file">选择备份文件</label>
+      <input class="backup-file" id="backup-file" type="file" name="backup"
+             accept=".zip,.db" required>
+      <div class="backup-actions">
+        <button class="btn btn-danger" type="submit">上传并恢复</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="backup-history-head">
+    <div class="card-title">备份历史</div>
+    <span class="muted small">共 {{ backups|length }} 份 · 自动备份保留 7 份</span>
+  </div>
+  {% if backups %}
+  <div class="table-wrap">
+    <table class="table backup-table">
+      <thead><tr><th>备份文件</th><th>类型</th><th>大小</th><th>时间</th><th class="th-actions">操作</th></tr></thead>
+      <tbody>
+        {% for b in backups %}
+        <tr>
+          <td class="backup-name">{{ b.name }}</td>
+          <td><span class="badge badge-none">{{ b.kind }}</span></td>
+          <td class="muted">{{ b.size_text }}</td>
+          <td class="muted">{{ b.created_at }}</td>
+          <td class="td-actions">
+            <div class="backup-row-actions">
+              <a class="btn btn-xs" href="{{ url_for('settings_backup_download', name=b.name) }}">下载</a>
+              <form method="post" action="{{ url_for('settings_backup_restore_existing', name=b.name) }}"
+                    onsubmit="return confirm('用这个备份覆盖当前简历库和配置？系统会先自动备份当前数据。')">
+                <button class="btn btn-xs btn-danger-ghost" type="submit">恢复</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted backup-empty">还没有备份。建议先点击「立即备份」生成第一份。</p>
+  {% endif %}
+</div>
+
+<div class="card" id="diagnostics">
+  <div class="card-title">运行诊断与存储清理</div>
+  <p class="hint">需要请人协助排查时，导出诊断包即可：内含环境信息、数据规模统计和最近运行日志，不含简历正文、个人信息和 API Key。</p>
+  <p class="backup-path"><b>运行日志：</b><code>{{ log_file }}</code></p>
+
+  <div class="backup-grid">
+    <div class="backup-panel">
+      <div>
+        <div class="backup-panel-title">导出诊断包</div>
+        <p class="hint">适用于启动失败、导入异常、页面报错等情况；把错误编号一并提供即可定位。</p>
+      </div>
+      <div class="backup-actions">
+        <a class="btn btn-primary" href="{{ url_for('settings_diagnostics') }}">下载诊断包</a>
+      </div>
+    </div>
+
+    <form class="backup-panel" method="post" action="{{ url_for('settings_uploads_clean') }}"
+          onsubmit="return confirm('清理未被任何简历引用的原文件？已导入简历的原文件不受影响。')">
+      <div>
+        <div class="backup-panel-title">清理孤立原文件</div>
+        <p class="hint">
+          当前有 <b>{{ orphan_count }}</b> 个文件（约 {{ orphan_size }}）未关联任何简历，
+          通常是重复导入留下的副本。
+        </p>
+      </div>
+      <div class="backup-actions">
+        <button class="btn btn-secondary" type="submit" {% if not orphan_count %}disabled{% endif %}>立即清理</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div class="card" id="ai-settings">
   <div class="card-title">AI 厂商配置</div>
+  {% if provider_error %}
+  <div class="flash error" role="alert">
+    {{ provider_error }}。你仍可在下方重新填写并保存，系统会先备份原文件再重建配置。
+  </div>
+  {% endif %}
   <p class="dataflow-note">
     <b>数据流向：</b>关键词引擎全程在本机完成，简历不出本机；启用 AI 引擎或漏斗的复核阶段时，
     简历正文与模板内容会发送至所选厂商的接口，仅用于本次打分。Agent 协作模式不读取这里的 Key。
@@ -104,6 +213,7 @@
 (() => {
   const btn = document.getElementById('check-update-btn');
   const box = document.getElementById('update-result');
+  let pollTimer = null;
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[ch]);
@@ -116,40 +226,69 @@
     const status = data.update_available
       ? '<span class="badge badge-review">发现新版本</span>'
       : '<span class="badge badge-pass">已是最新</span>';
-    let html = `${status} 当前 ${esc(data.current_version)} · 更新源 ${esc(data.latest_version)}`;
+    let html = `${status} 当前 ${esc(data.current_version)} · Release ${esc(data.latest_version)}`;
     if (data.date) html += ` · ${esc(data.date)}`;
     if (data.title) html += `<br><b>${esc(data.title)}</b>`;
     if (data.notes && data.notes.length) {
       html += '<ul>' + data.notes.map((note) => `<li>${esc(note)}</li>`).join('') + '</ul>';
     }
     const url = String(data.download_url || '');
-    if (data.update_available && /^(https?:\/\/|\/|\.\.?\/)/i.test(url)) {
-      html += `<p><a class="btn btn-primary" href="${esc(url)}" target="_blank" rel="noopener">下载新版本</a></p>`;
+    if (data.update_available && /^https:\/\//i.test(url)) {
+      html += `<p><a class="btn btn-primary" href="${esc(url)}" target="_blank" rel="noopener">查看 Release / 下载</a></p>`;
     } else if (data.update_available) {
-      html += '<p class="hint">更新清单尚未提供有效下载地址，请联系维护者。</p>';
+      html += '<p class="hint">该 Release 没有有效的发布页地址，请前往 GitHub 仓库查看。</p>';
     }
     html += `<p class="hint">检查时间：${esc(data.checked_at)} · 来源：${esc(data.source)}</p>`;
     box.innerHTML = html;
   }
 
+  function renderStatus(data) {
+    if (pollTimer) clearTimeout(pollTimer);
+    if (data.result) render(data.result);
+    if (data.state === 'checking') {
+      btn.disabled = true;
+      btn.textContent = '检查中…';
+      if (!data.result) box.textContent = '正在查询 GitHub 最新正式 Release…';
+      pollTimer = setTimeout(refreshStatus, 1000);
+    } else {
+      btn.disabled = false;
+      btn.textContent = '检查更新';
+      if (!data.result) box.textContent = '尚未检查';
+    }
+  }
+
+  async function fetchStatus(url) {
+    const resp = await fetch(url, {cache: 'no-store'});
+    if (!resp.ok) throw new Error(`本地更新接口返回 HTTP ${resp.status}`);
+    return await resp.json();
+  }
+
+  async function refreshStatus() {
+    try {
+      renderStatus(await fetchStatus(btn.dataset.statusUrl));
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = '检查更新';
+      box.innerHTML = `<span class="badge badge-review">状态读取失败</span> ${esc(err.message || err)}`;
+    }
+  }
+
   async function check() {
     btn.disabled = true;
     btn.textContent = '检查中…';
-    box.textContent = '正在读取更新清单并比对版本…';
+    box.textContent = '正在启动 GitHub Release 检查…';
     try {
-      const resp = await fetch(btn.dataset.url, {cache: 'no-store'});
-      const data = await resp.json();
-      render(data);
+      renderStatus(await fetchStatus(btn.dataset.url));
     } catch (err) {
-      box.innerHTML = `<span class="badge badge-review">检查失败</span> ${esc(err.message || err)}`;
-    } finally {
       btn.disabled = false;
       btn.textContent = '检查更新';
+      box.innerHTML = `<span class="badge badge-review">检查失败</span> ${esc(err.message || err)}`;
     }
   }
 
   btn.addEventListener('click', check);
-  if (box.dataset.auto === '1') check();
+  // 这里只读取本地状态，不会因反复打开设置页而重复请求 GitHub。
+  refreshStatus();
 })();
 </script>
 {% endblock %}
