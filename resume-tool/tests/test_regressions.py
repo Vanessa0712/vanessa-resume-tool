@@ -1936,5 +1936,59 @@ class P1LibraryScanTests(unittest.TestCase):
             self.assertEqual(spy.call_count, 1)
 
 
+class ShutdownTests(unittest.TestCase):
+    """退出入口：既要真能停服务，也不能把正在跑的筛选任务掐死."""
+
+    def setUp(self):
+        appmod.app.config.update(TESTING=True)
+        self.client = make_test_client()
+        with appmod.JOBS_LOCK:
+            appmod.JOBS.clear()
+
+    def tearDown(self):
+        with appmod.JOBS_LOCK:
+            appmod.JOBS.clear()
+
+    def test_shutdown_returns_page_and_schedules_exit(self):
+        with patch.object(appmod, "schedule_shutdown") as spy:
+            response = self.client.post("/settings/shutdown")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("程序已退出", response.get_data(as_text=True))
+        self.assertEqual(spy.call_count, 1)
+
+    def test_shutdown_refused_while_job_running(self):
+        with appmod.JOBS_LOCK:
+            appmod.JOBS["run-1"] = {"id": "run-1", "state": "running"}
+        with patch.object(appmod, "schedule_shutdown") as spy:
+            response = self.client.post("/settings/shutdown")
+        self.assertEqual(response.status_code, 302)  # 退回设置页并提示
+        self.assertEqual(spy.call_count, 0)
+
+    def test_shutdown_allows_after_job_finished(self):
+        with appmod.JOBS_LOCK:
+            appmod.JOBS["done-1"] = {"id": "done-1", "state": "done"}
+        with patch.object(appmod, "schedule_shutdown") as spy:
+            response = self.client.post("/settings/shutdown")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(spy.call_count, 1)
+
+    def test_shutdown_requires_post(self):
+        self.assertEqual(self.client.get("/settings/shutdown").status_code, 405)
+
+    def test_schedule_shutdown_calls_exit_after_delay(self):
+        with patch.object(appmod, "_exit_process") as spy:
+            appmod.schedule_shutdown(0.01)
+            deadline = time.time() + 2
+            while not spy.called and time.time() < deadline:
+                time.sleep(0.01)
+        # daemon 定时器必须在延迟后真的调用退出函数，否则按钮点了没反应
+        self.assertEqual(spy.call_count, 1)
+
+    def test_settings_page_exposes_shutdown_entry(self):
+        page = self.client.get("/settings").get_data(as_text=True)
+        self.assertIn("退出程序", page)
+        self.assertIn("/settings/shutdown", page)
+
+
 if __name__ == "__main__":
     unittest.main()

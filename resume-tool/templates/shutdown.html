@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>程序已退出</title>
+<!-- 进程即将结束：本页不继承 base.html，也不引用任何静态资源，
+     避免退出后字体、样式或导航链接因服务已停而显示异常 -->
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f6f5f2;
+    color: #26221c;
+    font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
+    line-height: 1.7;
+  }
+  .box {
+    max-width: 520px;
+    margin: 24px;
+    padding: 32px 36px;
+    background: #fff;
+    border: 1px solid #e4e0d8;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(38, 34, 28, .06);
+  }
+  h1 { margin: 0 0 12px; font-size: 20px; font-weight: 600; }
+  p { margin: 0 0 12px; font-size: 14px; }
+  p:last-child { margin-bottom: 0; }
+  .tip {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: #f6f5f2;
+    border-radius: 6px;
+    font-size: 13px;
+    color: #6b6459;
+  }
+  code {
+    padding: 1px 5px;
+    background: #efebe3;
+    border-radius: 3px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>程序已退出</h1>
+    <p>后台服务已停止，现在可以直接关闭这个标签页。</p>
+    <p>简历数据、模板与筛选结果都已保存在本机，下次启动会原样恢复。</p>
+    <div class="tip">
+      需要重新使用，双击 <code>ResumeTool.exe</code> 再启动一次即可。
+      若几秒后页面仍能正常打开，说明程序还在运行，可以到任务管理器结束 <code>ResumeTool.exe</code>。
+    </div>
+  </div>
+</body>
+</html>

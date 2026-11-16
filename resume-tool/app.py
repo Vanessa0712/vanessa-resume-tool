@@ -281,6 +281,7 @@ CHANGELOG = [
             "导出 CSV / xlsx 统一转义 = + - @ 等公式前缀；清除筛选历史先存档 JSON 快照（保留 30 天），任务运行中拒绝清除",
             "简历库列表由三次全表扫描合并为一次并补 created_at 索引，3 万条筛选记录下列表约 0.14 秒返回",
             "数据目录与安装目录分离，支持一致性备份、每日自动备份与恢复；删除移入 .trash 暂存 30 天可找回",
+            "设置页新增「退出程序」入口：打包后不必再用任务管理器结束进程，筛选任务运行时会拒绝退出",
         ],
     },
 ]
@@ -3193,6 +3194,38 @@ def settings_preview():
     save_app_settings(cfg)
     flash("通用设置已保存")
     return redirect(url_for("settings"))
+
+
+def _exit_process() -> None:
+    """真正终止进程；单独抽成函数，便于测试替身（否则测试会杀掉自己）."""
+    try:
+        logging.shutdown()  # 先把日志缓冲落盘，再切断进程
+    finally:
+        os._exit(0)
+
+
+def schedule_shutdown(delay_s: float = 0.8) -> None:
+    """先让「已退出」页面回到浏览器，再结束进程.
+
+    延迟是必要的：立即退出会让浏览器拿不到响应，用户看到的是连接被重置，
+    分不清是「已退出」还是「程序崩了」。
+    """
+    timer = threading.Timer(delay_s, _exit_process)
+    timer.daemon = True
+    timer.start()
+
+
+@app.post("/settings/shutdown")
+def settings_shutdown():
+    """退出程序：打包后既无控制台也无窗口，用户需要一个显式的退出入口."""
+    with JOBS_LOCK:
+        active = any(j.get("state") in ("queued", "running") for j in JOBS.values())
+    if active:
+        flash("仍有筛选任务在运行，请等待完成后再退出", "error")
+        return redirect(url_for("settings", _anchor="shutdown"))
+    app.logger.info("收到退出请求，即将结束进程")
+    schedule_shutdown()
+    return render_template("shutdown.html")
 
 
 def _assert_flask_version() -> None:
