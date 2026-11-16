@@ -145,12 +145,12 @@
     </div>
 
     <form class="backup-panel" method="post" action="{{ url_for('settings_uploads_clean') }}"
-          onsubmit="return confirm('清理未被任何简历引用的原文件？已导入简历的原文件不受影响。')">
+          onsubmit="return confirm('把未被任何简历引用的原文件移入 .trash 暂存区？30 天内可恢复，已导入简历的原文件不受影响。')">
       <div>
         <div class="backup-panel-title">清理孤立原文件</div>
         <p class="hint">
           当前有 <b>{{ orphan_count }}</b> 个文件（约 {{ orphan_size }}）未关联任何简历，
-          通常是重复导入留下的副本。
+          通常是重复导入留下的副本。清理会移入 <code>.trash</code> 暂存区，30 天后自动清除。
         </p>
       </div>
       <div class="backup-actions">

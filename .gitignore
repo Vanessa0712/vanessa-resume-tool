@@ -57,3 +57,7 @@ Thumbs.db
 
 # 注意：resume-tool/samples/ 是有意保留的脱敏示例数据，不要加进来。
 # 若哪天示例换成真实简历，再追加一行 resume-tool/samples/ 即可。
+
+# ---- 删除暂存区（含原始简历，30 天后自动清理）----
+.trash/
+resume-tool/.trash/

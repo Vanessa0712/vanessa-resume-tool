@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 import uuid
 import zipfile
@@ -389,11 +390,13 @@ class PrivacyAndDiagnosticsTests(unittest.TestCase):
                 conn.close()
 
             with patch.multiple(appmod, DB=str(db_path), DATA_DIR=root, UPLOAD_DIR=uploads,
-                                BACKUP_DIR=root / "backups"):
+                                BACKUP_DIR=root / "backups", TRASH_DIR=root / ".trash"):
                 client = appmod.app.test_client()
                 client.post(f"/trash/{rid}/purge")
 
-            self.assertFalse(stored.exists(), "彻底删除后上传文件应被清理")
+            self.assertFalse(stored.exists(), "彻底删除后上传文件应移出 uploads")
+            moved = list((root / ".trash").rglob("候选人.txt"))
+            self.assertEqual(len(moved), 1, "原始文件应移入 .trash 暂存区以便恢复")
             conn = sqlite3.connect(db_path)
             try:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM resumes").fetchone()[0], 0)
@@ -432,16 +435,19 @@ class PrivacyAndDiagnosticsTests(unittest.TestCase):
             orphan = uploads / "batch-2" / "重复导入副本.txt"
             orphan.parent.mkdir(parents=True, exist_ok=True)
             orphan.write_text("重复内容", encoding="utf-8")
+            old = time.time() - 3600  # 模拟历史遗留文件，避开 10 分钟导入保护期
+            os.utime(orphan, (old, old))
 
             with patch.multiple(appmod, DB=str(db_path), DATA_DIR=root, UPLOAD_DIR=uploads,
-                                BACKUP_DIR=root / "backups"):
+                                BACKUP_DIR=root / "backups", TRASH_DIR=root / ".trash"):
                 client = appmod.app.test_client()
                 page = client.get("/settings")
                 self.assertEqual(page.status_code, 200)
                 self.assertIn("清理孤立原文件", page.get_data(as_text=True))
                 client.post("/settings/uploads/clean")
 
-            self.assertFalse(orphan.exists(), "孤立文件应被清理")
+            self.assertFalse(orphan.exists(), "孤立文件应被移出 uploads")
+            self.assertTrue((root / ".trash").is_dir(), "应移入 .trash 暂存区")
             self.assertTrue(stored.is_file(), "被简历引用的文件必须保留")
 
     def test_diagnostics_bundle_has_no_secret_or_resume_text(self):
@@ -614,7 +620,8 @@ class RouteSafetyTests(unittest.TestCase):
 
     def test_deleted_resume_cannot_download_or_export(self):
         rid = self._seed_resume(screenings=1)
-        self.assertEqual(self.client.get(f"/resume/{rid}/raw").status_code, 200)
+        with self.client.get(f"/resume/{rid}/raw") as resp:
+            self.assertEqual(resp.status_code, 200)
         conn = rt.get_conn(appmod.DB)
         try:
             conn.execute("UPDATE resumes SET deleted_at=? WHERE id=?", (rt.now(), rid))
@@ -654,6 +661,141 @@ class RouteSafetyTests(unittest.TestCase):
         response = self.client.post("/settings/backups/not-a-backup.zip/restore")
         self.assertEqual(response.status_code, 404)
 
+
+class RestoreAndJobSafetyTests(unittest.TestCase):
+    def test_restore_failure_keeps_current_database_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "resume_tool.db"
+            uploads = root / "uploads"
+            uploads.mkdir()
+            conn = rt.get_conn(str(db_path))
+            try:
+                for name in ("a.txt", "b.txt"):
+                    src = root / name
+                    src.write_text(f"{name} 内容", encoding="utf-8")
+                    rt.import_one(conn, src, store_base=uploads)
+            finally:
+                conn.close()
+
+            bad = root / "bad.zip"
+            with zipfile.ZipFile(bad, "w") as zf:
+                zf.writestr("resume_tool.db", "this is not a sqlite file")
+            with patch.multiple(appmod, DB=str(db_path), DATA_DIR=root,
+                                UPLOAD_DIR=uploads, BACKUP_DIR=root / "backups",
+                                TRASH_DIR=root / ".trash"):
+                with appmod.app.app_context():
+                    with self.assertRaises(ValueError):
+                        appmod.restore_backup(bad)
+            conn = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM resumes").fetchone()[0], 2)
+            finally:
+                conn.close()
+            self.assertFalse((root / "resume_tool.db.restore-tmp").exists())
+
+    def test_restore_sanitizes_and_reports_warnings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "src"
+            src.mkdir()
+            src_db = src / "resume_tool.db"
+            conn = rt.get_conn(str(src_db))
+            try:
+                r = src / "a.txt"
+                r.write_text("恢复候选人", encoding="utf-8")
+                rt.import_one(conn, r)
+                conn.execute("UPDATE resumes SET path=?", (r"C:\Windows\win.ini",))
+                conn.commit()
+            finally:
+                conn.close()
+            archive = root / "backup.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.write(src_db, "resume_tool.db")
+            dst = root / "dst"
+            dst.mkdir()
+            with patch.multiple(appmod, DB=str(dst / "resume_tool.db"), DATA_DIR=dst,
+                                UPLOAD_DIR=dst / "uploads", BACKUP_DIR=dst / "backups",
+                                TRASH_DIR=dst / ".trash"):
+                with appmod.app.app_context():
+                    result = appmod.restore_backup(archive)
+            self.assertIsInstance(result["warnings"], list)
+            conn = sqlite3.connect(dst / "resume_tool.db")
+            try:
+                self.assertEqual(conn.execute("SELECT path FROM resumes").fetchone()[0], "")
+            finally:
+                conn.close()
+
+    def test_job_gate_rejects_second_running_task(self):
+        with appmod.JOBS_LOCK:
+            appmod.JOBS.clear()
+        try:
+            jid = appmod.job_new("keyword", ["python-backend"], "all")
+            with self.assertRaises(RuntimeError):
+                appmod.job_new("keyword", ["python-backend"], "all")
+            appmod.job_update(jid, state="done")
+            # 完成后可再次提交
+            self.assertTrue(appmod.job_new("keyword", ["python-backend"], "all"))
+        finally:
+            with appmod.JOBS_LOCK:
+                appmod.JOBS.clear()
+
+    def test_purge_old_trash_respects_retention(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trash = root / ".trash"
+            old_dir = trash / "20200101-000000"
+            old_dir.mkdir(parents=True)
+            old_file = old_dir / "旧文件.txt"
+            old_file.write_text("old", encoding="utf-8")
+            stale = time.time() - 40 * 86400
+            os.utime(old_file, (stale, stale))
+            os.utime(old_dir, (stale, stale))
+            fresh_dir = trash / "fresh"
+            fresh_dir.mkdir()
+            fresh_file = fresh_dir / "新文件.txt"
+            fresh_file.write_text("new", encoding="utf-8")
+
+            with patch.object(appmod, "TRASH_DIR", trash):
+                removed, freed = appmod.purge_old_trash(days=30)
+            self.assertEqual(removed, 1)
+            self.assertEqual(freed, 3)
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(fresh_file.is_file())
+
+    def test_orphan_scan_skips_recent_and_partial_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uploads = root / "uploads"
+            uploads.mkdir()
+            conn = rt.get_conn(str(root / "resume_tool.db"))
+            try:
+                fresh = uploads / "刚导入.txt"
+                fresh.write_text("x", encoding="utf-8")
+                partial = uploads / "上传中.txt.partial"
+                partial.write_text("y", encoding="utf-8")
+                old = time.time() - 3600
+                os.utime(partial, (old, old))
+                stale = uploads / "历史孤立.txt"
+                stale.write_text("z", encoding="utf-8")
+                os.utime(stale, (old, old))
+                with patch.multiple(appmod, DATA_DIR=root, UPLOAD_DIR=uploads):
+                    orphans, _ = appmod.find_orphan_uploads(conn)
+            finally:
+                conn.close()
+            names = {p.name for p in orphans}
+            self.assertNotIn("刚导入.txt", names, "10 分钟内新文件不应被判为孤立")
+            self.assertNotIn("上传中.txt.partial", names, "半成品文件不参与清理")
+            self.assertIn("历史孤立.txt", names)
+
+    def test_cli_uses_same_data_dir_as_web(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"RESUME_TOOL_DATA_DIR": td}):
+                self.assertEqual(rt.resolve_data_dir(), Path(td).resolve())
+        self.assertEqual(Path(rt.DEFAULT_DB).parent, rt.DATA_DIR)
+        self.assertEqual(rt.DEFAULT_PROVIDERS, rt.DATA_DIR / "config" / "providers.json")
+
     def test_xlsx_route_deduplicates_selected_ids(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -669,7 +811,7 @@ class RouteSafetyTests(unittest.TestCase):
             finally:
                 conn.close()
             with patch.object(appmod, "DB", str(db_path)):
-                response = self.client.get(
+                response = appmod.app.test_client().get(
                     f"/export-xlsx?ids={ids[0]},{ids[1]}&ids={ids[0]},{ids[1]}")
             self.assertEqual(response.status_code, 200)
             wb = load_workbook(BytesIO(response.data), read_only=True)

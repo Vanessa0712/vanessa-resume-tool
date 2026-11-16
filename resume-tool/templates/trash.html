@@ -4,12 +4,12 @@
 <div class="page-head">
   <div>
     <h1>回收站</h1>
-    <p class="subtitle">删除的简历先进入这里，可随时恢复；彻底删除后筛选记录一并清除（磁盘原文件保留）</p>
+    <p class="subtitle">删除的简历先进入这里，可随时恢复；彻底删除后筛选记录一并清除，原始文件移入 .trash 暂存区（30 天内可恢复）</p>
   </div>
   <div class="head-actions">
     {% if rows %}
     <form method="post" action="{{ url_for('trash_empty') }}"
-          onsubmit="return confirm('确认清空回收站？将彻底删除 {{ rows|length }} 份简历及其筛选记录，不可恢复。')">
+          onsubmit="return confirm('确认清空回收站？将彻底删除 {{ rows|length }} 份简历及其筛选记录；原始文件移入 .trash 暂存区，30 天内可恢复。')">
       <button class="btn btn-danger" type="submit">清空回收站</button>
     </form>
     {% endif %}
@@ -38,7 +38,7 @@
               <button class="btn btn-xs" type="submit">恢复</button>
             </form>
             <form method="post" action="{{ url_for('trash_purge', rid=r.id) }}" class="inline"
-                  onsubmit="return confirm('彻底删除「{{ r.filename }}」及其筛选记录？此操作不可恢复。')">
+                  onsubmit="return confirm('彻底删除「{{ r.filename }}」及其筛选记录？原始文件会移入 .trash 暂存区，30 天内可恢复。')">
               <button class="btn btn-xs btn-danger-ghost" type="submit">彻底删除</button>
             </form>
           </td>

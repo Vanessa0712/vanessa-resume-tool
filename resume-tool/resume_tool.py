@@ -36,6 +36,7 @@ import hashlib
 import html as html_mod
 import io
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -53,8 +54,27 @@ except ImportError:
     PdfReader = None
 
 SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".docx", ".doc", ".pdf"}
-DEFAULT_DB = "resume_tool.db"
-DEFAULT_PROVIDERS = Path("config/providers.json")
+
+
+def resolve_data_dir() -> Path:
+    """数据目录：与 Web 端保持同一口径（环境变量 > exe 的 LOCALAPPDATA > 源码目录）.
+
+    CLI 与 Web 必须读写同一个库，否则 exe 模式下 agent-import 写回的结果
+    在界面上看不到。
+    """
+    configured = os.environ.get("RESUME_TOOL_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(local) if local else (Path.home() / ".resume-tool")
+        return (root / "ResumeTool").resolve()
+    return Path(__file__).resolve().parent
+
+
+DATA_DIR = resolve_data_dir()
+DEFAULT_DB = str(DATA_DIR / "resume_tool.db")
+DEFAULT_PROVIDERS = DATA_DIR / "config" / "providers.json"
 
 
 # ============ 通用 ============

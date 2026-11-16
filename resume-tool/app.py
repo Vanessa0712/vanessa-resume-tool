@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import logging
@@ -66,6 +67,8 @@ PROVIDERS_PATH = CONFIG_DIR / "providers.json"
 APP_SETTINGS_PATH = CONFIG_DIR / "app_settings.json"
 UPLOAD_DIR = DATA_DIR / "uploads"
 BACKUP_DIR = DATA_DIR / "backups"
+TRASH_DIR = DATA_DIR / ".trash"
+TRASH_RETENTION_DAYS = 30
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "resume-tool.log"
 GITHUB_REPOSITORY = "Vanessa0712/vanessa-resume-tool"
@@ -90,7 +93,7 @@ def _copy_dir_missing(src: Path, dst: Path) -> None:
 def ensure_data_layout() -> None:
     """创建可写数据目录，并把旧源码目录/旧 exe 旁的数据复制过来（不删除旧数据）."""
     try:
-        for directory in (DATA_DIR, CONFIG_DIR, TPL_DIR, UPLOAD_DIR, BACKUP_DIR, LOG_DIR):
+        for directory in (DATA_DIR, CONFIG_DIR, TPL_DIR, UPLOAD_DIR, BACKUP_DIR, LOG_DIR, TRASH_DIR):
             directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(f"无法创建数据目录 {DATA_DIR}：{exc}") from exc
@@ -176,6 +179,20 @@ def protect_local_mutations():
 
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
+    {
+        "version": "ver1.2.5",
+        "channel": "Beta",
+        "date": "2026-11-16",
+        "title": "恢复事务化、删除可恢复与并发闸门",
+        "entries": [
+            "恢复备份改为「临时库 + 原子替换」：任一步失败都不会覆盖现有数据库，提示改为「当前数据库未被替换」",
+            "彻底删除与孤立文件清理改为移入 .trash 暂存区，保留 30 天后自动清除，误点可找回",
+            "上传与目录导入改为先写 .partial 再原子改名；孤立文件扫描跳过 10 分钟内的新文件，避免误删正在导入的简历",
+            "同一时间只允许一个筛选任务，防止连点造成重复调用与并发写库；任务状态读取改为返回副本",
+            "依赖锁定 flask>=3.1,<4（Host 白名单需要 3.1+），默认使用 waitress 提供 Web 服务",
+            "CLI 与 Web 共用同一数据目录，Agent 协作写回的结果在界面上直接可见",
+        ],
+    },
     {
         "version": "ver1.2.4",
         "channel": "Beta",
@@ -744,7 +761,11 @@ def backup_file(name: str) -> Path | None:
 
 
 def _validate_restore_db(path: Path) -> None:
-    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    """校验备份中的数据库：可读、完整、具备必需表；异常统一转为可展示的错误."""
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"备份中的数据库无法打开：{exc}") from exc
     try:
         check = conn.execute("PRAGMA integrity_check").fetchone()
         if not check or check[0] != "ok":
@@ -754,115 +775,171 @@ def _validate_restore_db(path: Path) -> None:
         missing = {"resumes", "persons", "screenings"} - tables
         if missing:
             raise ValueError(f"备份不是有效的简历库，缺少表：{', '.join(sorted(missing))}")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"备份中的数据库无法读取或已损坏：{exc}") from exc
     finally:
         conn.close()
 
 
 def restore_backup(archive: Path) -> dict:
-    """从备份 ZIP/DB 恢复；恢复前必定先生成 pre-restore 备份."""
+    """从备份 ZIP/DB 恢复：先校验并落到临时库，成功后再原子替换.
+
+    全程不在现库上直接写：任何一步失败，当前数据库都保持原样；只有最后的
+    `os.replace` 是原子动作。配置与原始文件在替换前准备就绪，失败只记录警告。
+    """
     with JOBS_LOCK:
         active = any(j.get("state") in ("queued", "running") for j in JOBS.values())
     if active:
         raise ValueError("仍有筛选任务在运行，请等待完成或重启应用后再恢复")
 
+    db_path = Path(DB)
+    staging = db_path.with_name(db_path.name + ".restore-tmp")
+    warnings: list[str] = []
     restored_uploads = 0
-    with tempfile.TemporaryDirectory(prefix="resume-tool-restore-") as td:
-        temp = Path(td)
-        db_file = archive
-        config_entries: dict[str, bytes] = {}
-        upload_entries: list[tuple[str, zipfile.ZipInfo]] = []
-        zf = None
-        if archive.suffix.lower() == ".zip":
-            zf = zipfile.ZipFile(archive)
+    upload_failed = 0
+    pre = None
+    swapped = False
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="resume-tool-restore-") as td:
+            temp = Path(td)
+            db_file = archive
+            config_entries: dict[str, bytes] = {}
+            upload_entries: list[tuple[str, zipfile.ZipInfo]] = []
+
+            if archive.suffix.lower() == ".zip":
+                with zipfile.ZipFile(archive) as zf:
+                    names = {info.filename: info for info in zf.infolist()}
+                    if "resume_tool.db" not in names:
+                        raise ValueError("备份包中缺少 resume_tool.db")
+                    info = names["resume_tool.db"]
+                    if info.file_size > 1024 * 1024 * 1024:
+                        raise ValueError("备份中的数据库超过 1GB，已拒绝恢复")
+                    db_file = temp / "resume_tool.db"
+                    with zf.open(info) as src, open(db_file, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    allowed_config = {"config/app_settings.json", "config/providers.json"}
+                    for name, item in names.items():
+                        if name in allowed_config:
+                            if item.file_size <= 5 * 1024 * 1024:
+                                config_entries[name] = zf.read(item)
+                        elif name.startswith("config/templates/") and name.endswith(".json"):
+                            slug = name[len("config/templates/"):-len(".json")]
+                            if re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug) \
+                                    and item.file_size <= 5 * 1024 * 1024:
+                                config_entries[name] = zf.read(item)
+                        elif name.startswith("uploads/") and not name.endswith("/"):
+                            rel = name[len("uploads/"):]
+                            if (rel and ".." not in Path(rel).parts
+                                    and not Path(rel).is_absolute()
+                                    and item.file_size <= 256 * 1024 * 1024):
+                                upload_entries.append((rel, item))
+
+            # 1) 校验通过之前不碰现库
+            _validate_restore_db(db_file)
+
+            # 2) 新库先落到同盘临时文件，再在临时库上做路径归一与净化
+            if staging.exists():
+                staging.unlink()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            src = sqlite3.connect(db_file)
+            dst = None
             try:
-                names = {info.filename: info for info in zf.infolist()}
-                if "resume_tool.db" not in names:
-                    raise ValueError("备份包中缺少 resume_tool.db")
-                info = names["resume_tool.db"]
-                if info.file_size > 1024 * 1024 * 1024:
-                    raise ValueError("备份中的数据库超过 1GB，已拒绝恢复")
-                db_file = temp / "resume_tool.db"
-                with zf.open(info) as src, open(db_file, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                allowed_config = {"config/app_settings.json", "config/providers.json"}
-                for name, info in names.items():
-                    if name in allowed_config:
-                        if info.file_size <= 5 * 1024 * 1024:
-                            config_entries[name] = zf.read(info)
-                    elif name.startswith("config/templates/") and name.endswith(".json"):
-                        slug = name[len("config/templates/"):-len(".json")]
-                        if re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug) \
-                                and info.file_size <= 5 * 1024 * 1024:
-                            config_entries[name] = zf.read(info)
-                    elif name.startswith("uploads/") and not name.endswith("/"):
-                        rel = name[len("uploads/"):]
-                        if (rel and ".." not in Path(rel).parts
-                                and not Path(rel).is_absolute()
-                                and info.file_size <= 256 * 1024 * 1024):
-                            upload_entries.append((rel, info))
+                dst = sqlite3.connect(staging)
+                src.backup(dst)
             finally:
-                zf.close()
-
-        _validate_restore_db(db_file)
-        pre = (create_backup("pre-restore", include_uploads=False)
-               if Path(DB).is_file() else None)
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-        conn = g.pop("db_conn", None)
-        if conn is not None:
-            conn.close()
-        src = sqlite3.connect(db_file)
-        dst = sqlite3.connect(DB)
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-            src.close()
-        rt._MIGRATED_DBS.clear()
-        rt._FTS_STATE.clear()
-        path_conn = sqlite3.connect(DB)
-        try:
-            normalize_upload_paths(path_conn)
-            sanitize_resume_paths(path_conn)  # 备份包可能携带任意绝对路径
-        finally:
-            path_conn.close()
-
-        for name, raw in config_entries.items():
+                if dst is not None:
+                    dst.close()
+                src.close()
+            stage_conn = sqlite3.connect(staging)
             try:
-                json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            try:
-                if name == "config/providers.json":
-                    rt.write_providers(PROVIDERS_PATH, json.loads(raw.decode("utf-8")))
-                elif name == "config/app_settings.json":
-                    APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    APP_SETTINGS_PATH.write_bytes(raw)
+                normalize_upload_paths(stage_conn)
+                sanitize_resume_paths(stage_conn)  # 备份包可能携带任意绝对路径
+            finally:
+                stage_conn.close()
+
+            # 3) 配置先写临时文件并校验，替换留到数据库切换之后
+            config_stage: list[tuple[Path, Path]] = []
+            for name, raw in config_entries.items():
+                try:
+                    json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    warnings.append(f"{name} 不是有效 JSON，已跳过")
+                    continue
+                if name == "config/app_settings.json":
+                    dest = APP_SETTINGS_PATH
+                elif name == "config/providers.json":
+                    dest = PROVIDERS_PATH
                 else:
                     dest = template_dest(Path(name).stem)
-                    if dest is not None:
-                        dest.write_bytes(raw)
-            except OSError:
-                pass  # 数据库已恢复成功，单个配置写入失败不应把整体判为失败
+                    if dest is None:
+                        continue
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.with_name(dest.name + ".restore-tmp")
+                    tmp.write_bytes(raw)
+                    if name == "config/providers.json":
+                        rt.read_providers(tmp)  # 结构不合法就抛错，避免覆盖成坏配置
+                except (OSError, ValueError, rt.ProviderConfigError) as exc:
+                    warnings.append(f"{name} 未恢复：{exc}")
+                    continue
+                config_stage.append((tmp, dest))
 
-        if upload_entries and zf is not None:
-            zf = zipfile.ZipFile(archive)
+            # 4) 原始文件先复制（同名覆盖），失败只记警告，不影响数据库切换
+            if upload_entries:
+                with zipfile.ZipFile(archive) as zf:
+                    for rel, info in upload_entries:
+                        dest = (UPLOAD_DIR / Path(rel)).resolve()
+                        if not dest.is_relative_to(UPLOAD_DIR.resolve()):
+                            continue
+                        try:
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            with zf.open(info) as src, open(dest, "wb") as out:
+                                shutil.copyfileobj(src, out)
+                            restored_uploads += 1
+                        except OSError as exc:
+                            upload_failed += 1
+                            app.logger.warning("恢复原文件失败 %s：%s", rel, exc)
+
+            # 5) 现库备份 + 关连接 + 去掉旁路文件，最后一步原子替换
+            if db_path.is_file():
+                pre = create_backup("pre-restore", include_uploads=False)
+            conn = g.pop("db_conn", None)
+            if conn is not None:
+                conn.close()
+            rt._MIGRATED_DBS.clear()
+            rt._FTS_STATE.clear()
+            for suffix in ("-wal", "-shm"):
+                side = db_path.with_name(db_path.name + suffix)
+                try:
+                    if side.exists():
+                        side.unlink()
+                except OSError as exc:
+                    app.logger.warning("清理 %s 失败：%s", side, exc)
+            os.replace(staging, DB)
+            swapped = True
+
+            # 6) 数据库已切换，再落配置；配置失败不回滚数据库，但要说清楚
+            for tmp, dest in config_stage:
+                try:
+                    os.replace(tmp, dest)
+                except OSError as exc:
+                    warnings.append(f"{dest.name} 未恢复：{exc}")
+    finally:
+        if not swapped and staging.exists():
             try:
-                for rel, info in upload_entries:
-                    dest = (UPLOAD_DIR / Path(rel)).resolve()
-                    if not dest.is_relative_to(UPLOAD_DIR.resolve()):
-                        continue
-                    try:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(info) as src, open(dest, "wb") as out:
-                            shutil.copyfileobj(src, out)
-                        restored_uploads += 1
-                    except OSError:
-                        continue
-            finally:
-                zf.close()
-    return {"pre_backup": pre.name if pre else "", "uploads": restored_uploads}
+                staging.unlink()
+            except OSError:
+                pass
 
+    if upload_failed:
+        warnings.append(f"{upload_failed} 个原始文件未能恢复，详情见运行日志")
+    return {
+        "pre_backup": pre.name if pre else "",
+        "uploads": restored_uploads,
+        "warnings": warnings,
+    }
 
 # ---------- 版本更新（GitHub 最新正式 Release） ----------
 
@@ -1088,10 +1165,16 @@ JOB_KEEP = 30
 
 
 def job_new(engine: str, slugs: list[str], scope: str) -> str:
+    """登记新任务；已有排队/运行中的任务时拒绝，避免并发写库与重复计费."""
     jid = uuid.uuid4().hex[:10]
     with JOBS_LOCK:
+        if any(j.get("state") in ("queued", "running") for j in JOBS.values()):
+            raise RuntimeError("已有筛选任务在运行，请等待完成或重启应用后再试")
         if len(JOBS) >= JOB_KEEP:  # 只保留最近任务，避免内存无限增长
-            for old in sorted(JOBS, key=lambda k: JOBS[k]["started"])[: len(JOBS) - JOB_KEEP + 1]:
+            finished = [k for k, j in JOBS.items()
+                        if j.get("state") not in ("queued", "running")]
+            excess = len(JOBS) - JOB_KEEP + 1
+            for old in sorted(finished, key=lambda k: JOBS[k]["started"])[:excess]:
                 JOBS.pop(old, None)
         JOBS[jid] = {
             "id": jid, "state": "queued", "engine": engine, "slugs": slugs, "scope": scope,
@@ -1105,7 +1188,8 @@ def job_get(jid: str | None) -> dict | None:
     if not jid:
         return None
     with JOBS_LOCK:
-        return JOBS.get(jid)
+        job = JOBS.get(jid)
+        return copy.deepcopy(job) if job is not None else None
 
 
 def job_update(jid: str, **kw) -> None:
@@ -1211,8 +1295,13 @@ def run_screening_job(jid: str, engine: str, slugs: list[str], ids: list[int] | 
                 pass
 
 
-def start_job(engine: str, slugs: list[str], ids: list[int] | None, scope: str) -> str:
-    jid = job_new(engine, slugs, scope)
+def start_job(engine: str, slugs: list[str], ids: list[int] | None, scope: str) -> str | None:
+    """启动后台筛选；已有任务在运行时返回 None，由调用方提示用户."""
+    try:
+        jid = job_new(engine, slugs, scope)
+    except RuntimeError as exc:
+        app.logger.warning("拒绝重复筛选任务：%s", exc)
+        return None
     try:
         threading.Thread(target=run_screening_job, args=(jid, engine, slugs, ids, scope),
                          daemon=True).start()
@@ -1351,13 +1440,19 @@ def import_dir():
         while dest.exists():
             dest = copied_dir / f"{p.stem[:150]}-{n}{p.suffix}"
             n += 1
+        part = dest.with_name(dest.name + ".partial")
         try:
-            shutil.copy2(p, dest)
+            shutil.copy2(p, part)
+            os.replace(part, dest)  # 先写 .partial 再原子改名，避免被并发清理误删
             result, detail, _ = rt.import_one_detail(
                 conn, dest, store_base=UPLOAD_DIR)
             if result in ("dup", "empty"):
                 dest.unlink(missing_ok=True)  # 未产生新引用，不保留重复副本
         except Exception as exc:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
             result, detail = "error", f"导入异常：{exc}"
         if result == "error":
             counts["errors"] += 1
@@ -1384,10 +1479,18 @@ def import_files():
         # 保留中文文件名，仅去路径分隔符（secure_filename 会把中文剥光）
         safe = Path(f.filename).name.replace("/", "_").replace("\\", "_")
         dest = batch / safe
+        part = dest.with_name(dest.name + ".partial")
         try:
-            f.save(dest)
+            f.save(part)
+            os.replace(part, dest)  # 原子落盘：避免半截文件被当成孤立文件
             result, detail, _ = rt.import_one_detail(conn, dest, store_base=UPLOAD_DIR)
+            if result in ("dup", "empty"):
+                dest.unlink(missing_ok=True)  # 与目录导入一致，未引用不留副本
         except Exception as exc:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
             result, detail = "error", f"导入异常：{exc}"
         if result == "error":
             counts["errors"] += 1
@@ -1640,15 +1743,61 @@ def human_size(size: int) -> str:
     return f"{size / 1024 / 1024 / 1024:.2f} GB"
 
 
-def _delete_upload_files(raw_paths: list[str], keep_paths: set[str] | None = None) -> tuple[int, int]:
-    """删除数据目录内的原始文件；返回 (已删除, 未处理).
+def _trash_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    外部目录导入的历史文件不会被擅自删除，只计入未处理，由用户自行决定。
+
+def _retire_paths(paths: list[Path]) -> tuple[int, int]:
+    """把 uploads/ 内的文件移入 .trash/<时间戳>/ 暂存；返回 (已移入, 未处理).
+
+    直接 unlink 一旦误点就无法挽回，先移入暂存区、保留 30 天再清理。
+    """
+    root = UPLOAD_DIR.resolve()
+    try:
+        trash_root = TRASH_DIR.resolve()
+    except OSError:
+        trash_root = TRASH_DIR
+    stamp = _trash_stamp()
+    moved = failed = 0
+    touched_dirs: set[Path] = set()
+    for path in paths:
+        try:
+            rel = path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            failed += 1
+            continue
+        if rel.parts and rel.parts[0] == "..":
+            failed += 1
+            continue
+        dest = trash_root / stamp / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                dest = dest.with_name(f"{dest.stem}-{uuid.uuid4().hex[:6]}{dest.suffix}")
+            shutil.move(str(path), str(dest))
+            moved += 1
+            touched_dirs.add(path.parent)
+        except OSError as exc:
+            app.logger.warning("移入暂存区失败 %s：%s", path, exc)
+            failed += 1
+    # 清掉空的批次目录，避免 uploads/ 里堆大量空文件夹
+    for directory in touched_dirs:
+        try:
+            if directory != root and directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+    return moved, failed
+
+
+def _delete_upload_files(raw_paths: list[str], keep_paths: set[str] | None = None) -> tuple[int, int]:
+    """把数据目录内的原始文件移入暂存区；返回 (已移入, 未处理).
+
+    外部目录导入的历史文件不会被擅自移动，只计入未处理，由用户自行决定。
     """
     keep_paths = keep_paths or set()
-    root = UPLOAD_DIR.resolve()
-    deleted = kept = 0
-    touched_dirs: set[Path] = set()
+    targets: list[Path] = []
+    kept = 0
     for raw in raw_paths:
         if raw in keep_paths:
             kept += 1
@@ -1658,33 +1807,49 @@ def _delete_upload_files(raw_paths: list[str], keep_paths: set[str] | None = Non
             if str(raw or "").strip():
                 kept += 1
             continue
-        try:
-            if path.is_file():
-                path.unlink()
-                deleted += 1
-                touched_dirs.add(path.parent)
-            else:
-                kept += 1
-        except OSError as exc:
-            app.logger.warning("删除原文件失败 %s：%s", path, exc)
+        if not path.is_file():
             kept += 1
-    # 清掉空的批次目录，避免 uploads/ 里堆大量空文件夹
-    for directory in touched_dirs:
+            continue
+        targets.append(path)
+    moved, failed = _retire_paths(targets)
+    return moved, kept + failed
+
+
+def purge_old_trash(days: int = TRASH_RETENTION_DAYS) -> tuple[int, int]:
+    """清理超过保留期的暂存文件；返回 (删除文件数, 释放字节数)."""
+    if not TRASH_DIR.is_dir():
+        return 0, 0
+    cutoff = time.time() - days * 86400
+    removed = freed = 0
+    for entry in TRASH_DIR.iterdir():
+        if not entry.is_dir():
+            continue
         try:
-            if directory != root and directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
-        except OSError:
-            pass
-    return deleted, kept
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            for path in entry.rglob("*"):
+                if path.is_file():
+                    try:
+                        freed += path.stat().st_size
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError as exc:
+            app.logger.warning("清理暂存区失败 %s：%s", entry, exc)
+    return removed, freed
 
 
-def _purge_message(filename: str, deleted: int, kept: int) -> str:
-    if deleted and kept:
-        return f"已彻底删除「{filename}」，其中 {deleted} 个原始文件已从数据目录移除；{kept} 个文件在数据目录之外，未删除"
-    if deleted:
-        return f"已彻底删除「{filename}」及其原始文件"
+def _purge_message(filename: str, moved: int, kept: int) -> str:
+    if moved and kept:
+        return (f"已彻底删除「{filename}」；{moved} 个原始文件移入暂存区 .trash"
+                f"（{TRASH_RETENTION_DAYS} 天内可恢复），{kept} 个不在数据目录，未处理")
+    if moved:
+        return (f"已彻底删除「{filename}」；原始文件移入暂存区 .trash"
+                f"（{TRASH_RETENTION_DAYS} 天内可恢复）")
     if kept:
-        return f"已彻底删除「{filename}」及其筛选记录；原始文件不在数据目录，未自动删除"
+        return f"已彻底删除「{filename}」及其筛选记录；原始文件不在数据目录，未自动处理"
     return f"已彻底删除「{filename}」及其筛选记录"
 
 
@@ -1697,15 +1862,21 @@ def find_orphan_uploads(conn) -> tuple[list[Path], int]:
             referenced.add(path)
     orphans: list[Path] = []
     total = 0
+    cutoff = time.time() - 600  # 正在导入的文件可能尚未写库，10 分钟内一律跳过
     if UPLOAD_DIR.is_dir():
         for path in UPLOAD_DIR.rglob("*"):
             if not path.is_file():
+                continue
+            if path.name.endswith(".partial"):
                 continue
             try:
                 resolved = path.resolve()
                 if resolved in referenced:
                     continue
-                total += path.stat().st_size
+                stat = path.stat()
+                if stat.st_mtime >= cutoff:
+                    continue
+                total += stat.st_size
             except OSError:
                 continue
             orphans.append(path)
@@ -1741,12 +1912,13 @@ def trash_empty():
     _drop_orphan_persons(conn)
     conn.commit()
     remaining = {r[0] for r in conn.execute("SELECT path FROM resumes WHERE path IS NOT NULL")}
-    deleted, kept = _delete_upload_files(paths, keep_paths=remaining)
+    moved, kept = _delete_upload_files(paths, keep_paths=remaining)
     msg = f"回收站已清空，彻底删除 {len(ids)} 份简历"
-    if deleted:
-        msg += f"，同时移除 {deleted} 个原始文件"
+    if moved:
+        msg += (f"；{moved} 个原始文件移入暂存区 .trash"
+                f"（{TRASH_RETENTION_DAYS} 天内可在数据目录恢复）")
     if kept:
-        msg += f"；{kept} 个原文件不在数据目录，未自动删除"
+        msg += f"；{kept} 个原文件不在数据目录，未自动处理"
     flash(msg)
     return redirect(url_for("trash"))
 
@@ -2103,6 +2275,9 @@ def screen_run():
     if engine in ("ai", "funnel") and len(slugs) > 1:
         flash(f"注意：AI 引擎将按「模板 × 简历」组合逐份调用，共 {len(slugs)} 个模板，请留意 API 用量")
     jid = start_job(engine, slugs, ids, scope)  # 立即返回，进度在页面轮询
+    if jid is None:
+        flash("已有筛选任务正在进行，请等待完成后再提交，避免重复调用与并发写库", "error")
+        return redirect(url_for("screen", templates=",".join(slugs)))
     return redirect(url_for("screen", templates=",".join(slugs), job=jid))
 
 
@@ -2521,30 +2696,19 @@ def settings_diagnostics():
 
 @app.post("/settings/uploads/clean")
 def settings_uploads_clean():
-    """清理 uploads/ 中没有任何简历引用的文件（重复导入副本、失败上传残留）."""
+    """把 uploads/ 中没有任何简历引用的文件移入暂存区（重复导入副本、失败上传残留）."""
     conn = db()
     orphans, total = find_orphan_uploads(conn)
     if not orphans:
         flash("没有需要清理的孤立文件")
         return redirect(url_for("settings", _anchor="diagnostics"))
-    removed = 0
-    touched: set[Path] = set()
-    root = UPLOAD_DIR.resolve()
-    for path in orphans:
-        try:
-            path.unlink()
-            removed += 1
-            touched.add(path.parent)
-        except OSError as exc:
-            app.logger.warning("清理孤立文件失败 %s：%s", path, exc)
-    for directory in touched:
-        try:
-            if directory != root and directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
-        except OSError:
-            pass
-    app.logger.info("清理孤立文件 %s 个，释放 %s 字节", removed, total)
-    flash(f"已清理 {removed} 个孤立文件，释放约 {human_size(total)}")
+    moved, failed = _retire_paths(orphans)
+    app.logger.info("孤立文件移入暂存区 %s 个（约 %s 字节）", moved, total)
+    msg = f"已将 {moved} 个孤立文件（约 {human_size(total)}）移入暂存区 .trash"
+    msg += f"；{TRASH_RETENTION_DAYS} 天后自动清理，期间可从数据目录恢复"
+    if failed:
+        msg += f"；{failed} 个文件处理失败，详情见日志"
+    flash(msg)
     return redirect(url_for("settings", _anchor="diagnostics"))
 
 
@@ -2556,11 +2720,16 @@ def settings_backup_restore_existing(name: str):
     try:
         result = restore_backup(path)
     except (OSError, ValueError, zipfile.BadZipFile, sqlite3.DatabaseError) as exc:
-        flash(f"恢复失败，原数据未改变：{exc}", "error")
+        flash(f"恢复失败，当前数据库未被替换：{exc}", "error")
     else:
         before = (f"恢复前数据备份为 {result['pre_backup']}"
                   if result["pre_backup"] else "目标是空数据目录，未生成恢复前备份")
-        flash(f"已从 {name} 恢复；{before}", "message")
+        msg = f"已从 {name} 恢复；{before}"
+        if result["uploads"]:
+            msg += f"，同时恢复了 {result['uploads']} 个原始文件"
+        if result["warnings"]:
+            msg += "；部分内容未恢复：" + "；".join(result["warnings"][:3])
+        flash(msg, "message")
     return redirect(url_for("settings", _anchor="backup"))
 
 
@@ -2580,12 +2749,14 @@ def settings_restore():
             upload.save(archive)
             result = restore_backup(archive)
     except (OSError, ValueError, zipfile.BadZipFile, sqlite3.DatabaseError) as exc:
-        flash(f"恢复失败，原数据未改变：{exc}", "error")
+        flash(f"恢复失败，当前数据库未被替换：{exc}", "error")
     else:
         msg = (f"恢复完成；恢复前数据已备份为 {result['pre_backup']}"
                if result["pre_backup"] else "恢复完成；目标是空数据目录，未生成恢复前备份")
         if result["uploads"]:
             msg += f"，同时恢复了 {result['uploads']} 个原始文件"
+        if result["warnings"]:
+            msg += "；部分内容未恢复：" + "；".join(result["warnings"][:3])
         flash(msg, "message")
     return redirect(url_for("settings", _anchor="backup"))
 
@@ -2646,8 +2817,22 @@ def settings_preview():
     return redirect(url_for("settings"))
 
 
+def _assert_flask_version() -> None:
+    """TRUSTED_HOSTS 是 Flask 3.1 才引入的；低于该版本 Host 防护会静默失效."""
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+    try:
+        raw = pkg_version("flask")
+    except PackageNotFoundError as exc:
+        raise RuntimeError("未安装 Flask，请先执行 pip install -r requirements.txt") from exc
+    nums = [int(n) for n in re.findall(r"\d+", raw)[:2]]
+    if len(nums) >= 2 and (nums[0] < 3 or (nums[0] == 3 and nums[1] < 1)):
+        raise RuntimeError(
+            f"Flask {raw} 版本过低：Host 白名单与同源校验需要 3.1 以上，请升级后再启动")
+
+
 def main() -> None:
     configure_logging()
+    _assert_flask_version()
     app.logger.info("启动简历工具 %s；数据目录 %s", current_version(), DATA_DIR)
     cfg = load_app_settings()
     try:
@@ -2661,6 +2846,12 @@ def main() -> None:
             conn.close()
     except (OSError, sqlite3.DatabaseError) as exc:
         app.logger.warning("简历路径迁移失败：%s", exc)
+    try:
+        purged, freed = purge_old_trash()
+        if purged:
+            app.logger.info("清理暂存区 %s 个过期文件，释放 %s", purged, human_size(freed))
+    except OSError as exc:
+        app.logger.warning("清理暂存区失败，不影响启动：%s", exc)
     if cfg.get("auto_check_updates", True):
         start_update_check()
     if cfg.get("auto_backup", True):
@@ -2671,7 +2862,14 @@ def main() -> None:
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:
             app.logger.warning("自动备份失败，不影响应用启动：%s", exc)
     # 单机桌面用途：只绑定回环地址，关闭 reloader（打包 exe 的硬性要求）
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
+    try:
+        from waitress import serve
+    except ImportError:
+        app.logger.warning("未安装 waitress，回退到 Flask 开发服务器（不建议分发给办公人员）")
+        app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
+    else:
+        app.logger.info("以 waitress 启动：http://127.0.0.1:5000")
+        serve(app, host="127.0.0.1", port=5000, threads=8)
 
 
 if __name__ == "__main__":
