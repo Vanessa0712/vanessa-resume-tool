@@ -71,6 +71,14 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 BACKUP_DIR = DATA_DIR / "backups"
 TRASH_DIR = DATA_DIR / ".trash"
 TRASH_RETENTION_DAYS = 30
+# 恢复备份的解压护栏：上传限制只管压缩包本身（256MB），高压缩比的 zip 可把小包
+# 解成几十 GB。条目数与累计字节双限，且以「实际解压字节」为准——ZipInfo.file_size
+# 是包头里的声明值，可被伪造，不能作为唯一依据。
+RESTORE_MAX_ENTRIES = 5000
+RESTORE_MAX_SINGLE_BYTES = 256 * 1024 * 1024
+RESTORE_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+RESTORE_CHUNK_BYTES = 1024 * 1024
+RESTORE_STAGE_NAME = ".restore-uploads-tmp"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "resume-tool.log"
 GITHUB_REPOSITORY = "Vanessa0712/vanessa-resume-tool"
@@ -99,6 +107,9 @@ def ensure_data_layout() -> None:
             directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(f"无法创建数据目录 {DATA_DIR}：{exc}") from exc
+
+    # 恢复流程异常中止会留下解压暂存区；启动时兜底清理（此刻不可能有恢复在跑）
+    shutil.rmtree(DATA_DIR / RESTORE_STAGE_NAME, ignore_errors=True)
 
     bundled_templates = RESOURCE_BASE / "config" / "templates"
     if bundled_templates.resolve() != TPL_DIR.resolve():
@@ -801,6 +812,8 @@ def restore_backup(archive: Path) -> dict:
 
     db_path = Path(DB)
     staging = db_path.with_name(db_path.name + ".restore-tmp")
+    # 暂存区放在 uploads 的同级（同盘 rename，且不在 uploads 内，不会被备份/孤儿扫描误收）
+    stage_dir = UPLOAD_DIR.parent / RESTORE_STAGE_NAME
     warnings: list[str] = []
     restored_uploads = 0
     upload_failed = 0
@@ -826,6 +839,7 @@ def restore_backup(archive: Path) -> dict:
                     with zf.open(info) as src, open(db_file, "wb") as dst:
                         shutil.copyfileobj(src, dst)
                     allowed_config = {"config/app_settings.json", "config/providers.json"}
+                    declared_uploads = 0
                     for name, item in names.items():
                         if name in allowed_config:
                             if item.file_size <= 5 * 1024 * 1024:
@@ -837,13 +851,58 @@ def restore_backup(archive: Path) -> dict:
                                 config_entries[name] = zf.read(item)
                         elif name.startswith("uploads/") and not name.endswith("/"):
                             rel = name[len("uploads/"):]
-                            if (rel and ".." not in Path(rel).parts
-                                    and not Path(rel).is_absolute()
-                                    and item.file_size <= 256 * 1024 * 1024):
-                                upload_entries.append((rel, item))
+                            if not (rel and ".." not in Path(rel).parts
+                                    and not Path(rel).is_absolute()):
+                                continue
+                            if item.file_size > RESTORE_MAX_SINGLE_BYTES:
+                                continue  # 单文件超限：跳过，不因此中断整包
+                            if len(upload_entries) >= RESTORE_MAX_ENTRIES:
+                                raise ValueError(
+                                    f"备份包中原始文件超过 {RESTORE_MAX_ENTRIES} 个，"
+                                    "已拒绝恢复；当前数据未改动")
+                            declared_uploads += item.file_size
+                            if declared_uploads > RESTORE_MAX_UPLOAD_BYTES:
+                                raise ValueError(
+                                    "备份包声明的原始文件总量超过 1GB，已拒绝恢复；"
+                                    "当前数据未改动")
+                            upload_entries.append((rel, item))
 
             # 1) 校验通过之前不碰现库
             _validate_restore_db(db_file)
+
+            # 1.5) 原始文件先解压到数据目录内的暂存区，按「实际字节」累计校验。
+            #      包头里的声明值可被伪造，只有真实解压量才能挡住压缩炸弹；任何
+            #      超限都在触碰 uploads 之前中止，现有原件保持原样。
+            if upload_entries:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                written = 0
+                try:
+                    with zipfile.ZipFile(archive) as zf:
+                        stage_root = stage_dir.resolve()
+                        for rel, info in upload_entries:
+                            target = (stage_dir / Path(rel)).resolve()
+                            if not target.is_relative_to(stage_root):
+                                continue
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with zf.open(info) as src, open(target, "wb") as out:
+                                while True:
+                                    chunk = src.read(RESTORE_CHUNK_BYTES)
+                                    if not chunk:
+                                        break
+                                    written += len(chunk)
+                                    if written > RESTORE_MAX_UPLOAD_BYTES:
+                                        raise ValueError(
+                                            "备份包解压后的原始文件总量超过 1GB"
+                                            "（按实际解压量计），已拒绝恢复；"
+                                            "当前数据未改动")
+                                    out.write(chunk)
+                except (zipfile.BadZipFile, OSError) as exc:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    raise ValueError(
+                        f"备份包中的原始文件无法解压，已取消恢复：{exc}") from exc
+                except ValueError:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    raise
 
             # 2) 新库先落到同盘临时文件，再在临时库上做路径归一与净化
             if staging.exists():
@@ -915,21 +974,24 @@ def restore_backup(archive: Path) -> dict:
                 except (OSError, ValueError, sqlite3.DatabaseError) as exc:
                     raise ValueError(f"恢复前备份失败，已取消恢复，现有数据未改动：{exc}") from exc
 
-            # 5) 原始文件复制（同名覆盖），失败只记警告，不影响数据库切换
+            # 5) 暂存的原始文件落到 uploads（同名覆盖）。这里只做同盘 rename，
+            #    不再解压，因此不会因中途异常留下写了一半的原件。
             if upload_entries:
-                with zipfile.ZipFile(archive) as zf:
-                    for rel, info in upload_entries:
-                        dest = (UPLOAD_DIR / Path(rel)).resolve()
-                        if not dest.is_relative_to(UPLOAD_DIR.resolve()):
-                            continue
-                        try:
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            with zf.open(info) as src, open(dest, "wb") as out:
-                                shutil.copyfileobj(src, out)
-                            restored_uploads += 1
-                        except OSError as exc:
-                            upload_failed += 1
-                            app.logger.warning("恢复原文件失败 %s：%s", rel, exc)
+                upload_root = UPLOAD_DIR.resolve()
+                for rel, _info in upload_entries:
+                    src_path = stage_dir / Path(rel)
+                    if not src_path.is_file():
+                        continue
+                    dest = (UPLOAD_DIR / Path(rel)).resolve()
+                    if not dest.is_relative_to(upload_root):
+                        continue
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(src_path, dest)
+                        restored_uploads += 1
+                    except OSError as exc:
+                        upload_failed += 1
+                        app.logger.warning("恢复原文件失败 %s：%s", rel, exc)
 
             # 6) 关连接 + 去掉旁路文件，最后一步原子替换
             conn = g.pop("db_conn", None)
@@ -959,6 +1021,8 @@ def restore_backup(archive: Path) -> dict:
                 staging.unlink()
             except OSError:
                 pass
+        # 暂存区失败必清；成功时文件已被 rename 走，剩下的是被跳过的条目
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
     if upload_failed:
         warnings.append(f"{upload_failed} 个原始文件未能恢复，详情见运行日志")
