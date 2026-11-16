@@ -2,23 +2,33 @@
 
 from __future__ import annotations
 
+import atexit
 import csv
 import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import unittest
+import uuid
 import zipfile
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import load_workbook
+# 测试必须与真实数据隔离：在任何 app 导入之前指向临时数据目录，
+# 并禁止把本机旧库迁移进来，否则测试会读写真实的简历库。
+TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="resume-tool-tests-"))
+os.environ["RESUME_TOOL_DATA_DIR"] = str(TEST_DATA_DIR)
+os.environ["RESUME_TOOL_SKIP_MIGRATION"] = "1"
+atexit.register(lambda: shutil.rmtree(TEST_DATA_DIR, ignore_errors=True))
 
-import app as appmod
-import resume_tool as rt
+from openpyxl import load_workbook  # noqa: E402
+
+import app as appmod  # noqa: E402
+import resume_tool as rt  # noqa: E402
 
 
 class UpdateSafetyTests(unittest.TestCase):
@@ -114,7 +124,8 @@ class DataDirectoryTests(unittest.TestCase):
                 APP_SETTINGS_PATH=data / "config" / "app_settings.json",
                 UPLOAD_DIR=data / "uploads", BACKUP_DIR=data / "backups",
             ):
-                appmod.ensure_data_layout()
+                with patch.dict(os.environ, {"RESUME_TOOL_SKIP_MIGRATION": "0"}):
+                    appmod.ensure_data_layout()
                 self.assertTrue((data / "resume_tool.db").is_file())
                 self.assertTrue((data / "uploads" / "batch1" / "a.txt").is_file())
                 self.assertTrue((data / "config" / "providers.json").is_file())
@@ -124,21 +135,67 @@ class DataDirectoryTests(unittest.TestCase):
     def test_relative_upload_path_and_normalization(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            old_abs = root / "old" / "uploads" / "batch" / "a.txt"
+            uploads = root / "uploads"
+            old_abs = uploads / "batch" / "a.txt"
             old_abs.parent.mkdir(parents=True)
             old_abs.write_text("x", encoding="utf-8")
             conn = sqlite3.connect(root / "test.db")
+            try:
+                conn.execute("CREATE TABLE resumes(id INTEGER PRIMARY KEY, path TEXT)")
+                conn.execute("INSERT INTO resumes(id, path) VALUES(1, ?)", (str(old_abs),))
+                conn.commit()
+                with patch.multiple(appmod, DATA_DIR=root, UPLOAD_DIR=uploads):
+                    self.assertEqual(appmod.normalize_upload_paths(conn), 1)
+                    stored = conn.execute(
+                        "SELECT path FROM resumes WHERE id=1").fetchone()[0]
+                    self.assertEqual(stored, "uploads/batch/a.txt")
+                    self.assertEqual(appmod.stored_resume_path(stored),
+                                     (uploads / "batch" / "a.txt").resolve())
+            finally:
+                conn.close()
+
+    def test_normalize_skips_paths_outside_upload_dir(self):
+        """外部目录里恰好也有 uploads/ 片段时，不能被误改写到数据目录."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "外部资料" / "uploads" / "2024" / "张三-后端.txt"
+            outside.parent.mkdir(parents=True)
+            outside.write_text("x", encoding="utf-8")
+            conn = sqlite3.connect(root / "test.db")
             conn.execute("CREATE TABLE resumes(id INTEGER PRIMARY KEY, path TEXT)")
-            conn.execute("INSERT INTO resumes(id, path) VALUES(1, ?)", (str(old_abs),))
+            conn.execute("INSERT INTO resumes(id, path) VALUES(1, ?)", (str(outside),))
             conn.commit()
-            with patch.object(appmod, "DATA_DIR", root):
-                changed = appmod.normalize_upload_paths(conn)
-                self.assertEqual(changed, 1)
-                stored = conn.execute("SELECT path FROM resumes WHERE id=1").fetchone()[0]
-                self.assertEqual(stored, "uploads/batch/a.txt")
-                self.assertEqual(appmod.stored_resume_path(stored),
-                                 (root / "uploads" / "batch" / "a.txt").resolve())
+            with patch.multiple(appmod, DATA_DIR=root / "data", UPLOAD_DIR=root / "data" / "uploads"):
+                self.assertEqual(appmod.normalize_upload_paths(conn), 0)
+            stored = conn.execute("SELECT path FROM resumes WHERE id=1").fetchone()[0]
+            self.assertEqual(stored, str(outside))
             conn.close()
+
+    def test_adopt_legacy_files_copies_into_upload_dir(self):
+        """数据目录内的历史原文件（如 samples/）收进 uploads，避免收紧路径后失效."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uploads = root / "uploads"
+            samples = root / "samples"
+            samples.mkdir()
+            src = samples / "示例.pdf"
+            src.write_bytes(b"%PDF-1.4 demo")
+            conn = rt.get_conn(str(root / "test.db"))
+            try:
+                conn.execute(
+                    "INSERT INTO resumes(filename, path, sha256, text, imported_at)"
+                    " VALUES(?,?,?,?,?)",
+                    ("示例.pdf", str(src), "a" * 64, "正文", rt.now()))
+                conn.commit()
+                with patch.multiple(appmod, DATA_DIR=root, UPLOAD_DIR=uploads):
+                    self.assertEqual(appmod.adopt_legacy_files(conn), 1)
+                    stored = conn.execute("SELECT path FROM resumes").fetchone()[0]
+                    self.assertEqual(stored, "uploads/legacy/示例.pdf")
+                    self.assertTrue((uploads / "legacy" / "示例.pdf").is_file())
+                    # 再跑一次不应重复迁移
+                    self.assertEqual(appmod.adopt_legacy_files(conn), 0)
+            finally:
+                conn.close()
 
 
 class BackupAndImportTests(unittest.TestCase):
@@ -482,6 +539,40 @@ class RouteSafetyTests(unittest.TestCase):
         appmod.app.config.update(TESTING=True)
         self.client = appmod.app.test_client()
 
+    def _seed_resume(self, screenings: int = 12) -> int:
+        """在临时数据目录里造一份简历 + 若干筛选记录，不依赖真实库."""
+        uploads = appmod.UPLOAD_DIR
+        uploads.mkdir(parents=True, exist_ok=True)
+        src = uploads / f"fixture-{uuid.uuid4().hex[:8]}.txt"
+        src.write_text("分页测试简历：2019-2023 后端开发经验", encoding="utf-8")
+        conn = rt.get_conn(appmod.DB)
+        try:
+            result, _, rid = rt.import_one_detail(conn, src, store_base=uploads)
+            self.assertIn(result, ("added", "restored", "dup"))
+            for i in range(screenings):
+                conn.execute(
+                    "INSERT INTO screenings(resume_id, engine, template, score, status,"
+                    " detail, created_at) VALUES(?,?,?,?,?,?,?)",
+                    (rid, "keyword", "python-backend", 80 - i, "通过",
+                     json.dumps({"reason": f"第 {i} 次"}), rt.now()))
+            conn.commit()
+        finally:
+            conn.close()
+        return int(rid)
+
+    def _insert_resume_with_path(self, path: str) -> int:
+        """直接插入一条指定 path 的简历记录，用于验证路径信任边界."""
+        conn = rt.get_conn(appmod.DB)
+        try:
+            cur = conn.execute(
+                "INSERT INTO resumes(filename, path, sha256, text, imported_at)"
+                " VALUES(?,?,?,?,?)",
+                ("外部文件.txt", path, uuid.uuid4().hex, "正文内容", rt.now()))
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
     def test_template_traversal_returns_404(self):
         for url in ("/templates/..%5Cproviders", "/templates/..%5Cproviders/export"):
             self.assertEqual(self.client.get(url).status_code, 404)
@@ -503,9 +594,52 @@ class RouteSafetyTests(unittest.TestCase):
                 self.assertIn("AI 配置读取失败", response.get_data(as_text=True))
 
     def test_resume_detail_pager_keeps_dynamic_route(self):
-        response = self.client.get("/resume/11")
+        rid = self._seed_resume()
+        response = self.client.get(f"/resume/{rid}")
         self.assertEqual(response.status_code, 200)
-        self.assertIn('action="/resume/11"', response.get_data(as_text=True))
+        self.assertIn(f'action="/resume/{rid}"', response.get_data(as_text=True))
+
+    def test_resume_raw_rejects_path_outside_data_dir(self):
+        """备份包可能携带任意绝对路径，此类记录必须读不到文件."""
+        outside = Path(tempfile.mkdtemp(prefix="outside-")) / "secret.txt"
+        outside.write_text("不该被读到", encoding="utf-8")
+        rid = self._insert_resume_with_path(str(outside))
+        try:
+            self.assertEqual(self.client.get(f"/resume/{rid}/raw").status_code, 404)
+            detail = self.client.get(f"/resume/{rid}")
+            self.assertEqual(detail.status_code, 200)
+            self.assertIn("原文件不可用", detail.get_data(as_text=True))
+        finally:
+            shutil.rmtree(outside.parent, ignore_errors=True)
+
+    def test_deleted_resume_cannot_download_or_export(self):
+        rid = self._seed_resume(screenings=1)
+        self.assertEqual(self.client.get(f"/resume/{rid}/raw").status_code, 200)
+        conn = rt.get_conn(appmod.DB)
+        try:
+            conn.execute("UPDATE resumes SET deleted_at=? WHERE id=?", (rt.now(), rid))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.client.get(f"/resume/{rid}/raw").status_code, 404)
+        self.assertEqual(self.client.get(f"/export-xlsx?ids={rid}").status_code, 302)
+        conn = rt.get_conn(appmod.DB)
+        try:
+            conn.execute("UPDATE resumes SET deleted_at=NULL WHERE id=?", (rid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_restore_sanitizes_external_absolute_paths(self):
+        rid = self._insert_resume_with_path(r"C:\Windows\win.ini")
+        conn = rt.get_conn(appmod.DB)
+        try:
+            changed = appmod.sanitize_resume_paths(conn)
+            stored = conn.execute("SELECT path FROM resumes WHERE id=?", (rid,)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertGreaterEqual(changed, 1)
+        self.assertEqual(stored, "")
 
     def test_screen_contains_ai_cost_confirmation(self):
         response = self.client.get("/screen")

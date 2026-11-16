@@ -200,7 +200,13 @@
       if (existing.includes(k)) return;
       const label = document.createElement('label');
       label.className = 'chip';
-      label.innerHTML = `<input type="checkbox" class="req-check" value="${k}"> ${k}`;
+      // 技能标识来自用户编辑的 JSON，用 DOM API 渲染而不是拼 HTML
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'req-check';
+      cb.value = k;
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(' ' + k));
       label.querySelector('input').addEventListener('change', e => {
         if (e.target.checked) checked.add(k); else checked.delete(k);
         label.classList.toggle('chip-on', e.target.checked);

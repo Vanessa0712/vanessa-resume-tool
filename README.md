@@ -139,6 +139,8 @@ Backup files are **not encrypted** and contain candidate PII and AI keys. Store 
 
 ## Privacy cleanup, logging and diagnostics
 
+- Path trust boundary: original files may only be located inside the data directory `uploads/`; absolute paths and `..` traversal are rejected, and out-of-bounds paths are sanitized after a restore. Legacy files inside the data directory (such as `samples/`) are copied into `uploads/legacy/` at startup and rewritten to relative paths
+- Trash isolation: resumes in the trash cannot be exported, downloaded or opened with a local program until restored
 - Permanent deletion: choosing "Delete permanently" or "Empty trash" also deletes the original files in the data directory `uploads/`; historical files imported from external directories are never deleted without consent — only their count is shown in the notice
 - Orphan cleanup: Settings → Run Diagnostics & Storage Cleanup counts files in `uploads/` that no resume references (copies left by duplicate imports, failed upload leftovers) and can remove them in one click to reclaim space
 - Runtime logs: written to `logs/resume-tool.log` in the data directory; 2 MB per file with 5 rotated files; scenes remain reconstructible after packaging as a console-less exe
@@ -151,14 +153,15 @@ Backup files are **not encrypted** and contain candidate PII and AI keys. Store 
 
 ## Verified (tested locally)
 
-- Key regression: `python -m unittest discover -s tests -v` (26 tests) covering export ID deduplication, CSV conventions, corrupted-config degradation, template path traversal, cross-site write requests, background job exceptions, DB connection release, backup/restore, restore into a fresh directory, data-directory migration, relative paths, import batches, source-file cleanup on permanent deletion, orphan cleanup, diagnostics-bundle redaction and template selection memory
+- Key regression: `python -m unittest discover -s tests -v` (31 tests) covering export ID deduplication, CSV conventions, corrupted-config degradation, template path traversal, cross-site write requests, background job exceptions, DB connection release, backup/restore, restore into a fresh directory, data-directory migration, relative paths, import batches, source-file cleanup on permanent deletion, orphan cleanup, diagnostics-bundle redaction, template selection memory, and path-trust boundaries (out-of-bounds rejection, no download from trash, path sanitizing after restore, legacy file adoption)
+- Tests run against an isolated temporary data directory (`RESUME_TOOL_DATA_DIR` + `RESUME_TOOL_SKIP_MIGRATION=1`) and never read or write the real resume library
 - 7 samples cover every format path (txt / real docx / docx disguised as .doc / HTML disguised as .doc / RTF disguised as .doc / hand-built PDF), all parsed correctly
 - Keyword engine: a senior backend candidate scoring 91.7 passes, a candidate missing required skills scores 0 and fails; gate and scoring logic are correct
 - When AI is not configured, actionable guidance is shown (no crash); funnel automatically degrades to a "manual review" hint when AI is unavailable
 - Duplicate imports are 100% deduplicated by content hash; CSV export uses utf-8-sig (opens cleanly in Excel)
 - **Full Agent collaboration chain (2026-11-14)**: 8 resumes keyword pre-screened → agent-export (PII masking active) → evaluated inside the Agent session → agent-import writes back 8 records (engine=ai + provider traceability) → Web UI /screen and CSV reports both display correctly
 
-## Web UI (Beta ver1.2.3)
+## Web UI (Beta ver1.2.4)
 
 ```bash
 python app.py        # → http://127.0.0.1:5000

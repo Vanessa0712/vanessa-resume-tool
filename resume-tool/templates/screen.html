@@ -268,14 +268,34 @@
         row.className = 'tpl-opt' + (on ? ' on' : '') + (idx === hi ? ' hi' : '');
         row.dataset.slug = t.slug;
         row.dataset.idx = idx;
-        row.innerHTML =
-          '<span class="tpl-check"></span>' +
-          '<span class="tpl-main">' +
-            '<span class="tpl-name">' + t.name +
-              (t.role ? ' <span class="tpl-role">' + t.role + '</span>' : '') + '</span>' +
-            '<span class="tpl-sub">' + t.department + ' · 必备 ' + t.required + '</span>' +
-          '</span>' +
-          '<span class="tpl-star' + (fav ? ' on' : '') + '" data-fav="' + t.slug + '" title="收藏">★</span>';
+        // 模板内容来自用户可编辑/可导入的 JSON，必须用 textContent 渲染，避免存储型 XSS
+        const checkEl = document.createElement('span');
+        checkEl.className = 'tpl-check';
+        const mainEl = document.createElement('span');
+        mainEl.className = 'tpl-main';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'tpl-name';
+        nameEl.textContent = t.name;
+        if (t.role) {
+          nameEl.appendChild(document.createTextNode(' '));
+          const roleEl = document.createElement('span');
+          roleEl.className = 'tpl-role';
+          roleEl.textContent = t.role;
+          nameEl.appendChild(roleEl);
+        }
+        const subEl = document.createElement('span');
+        subEl.className = 'tpl-sub';
+        subEl.textContent = t.department + ' · 必备 ' + t.required;
+        mainEl.appendChild(nameEl);
+        mainEl.appendChild(subEl);
+        const starEl = document.createElement('span');
+        starEl.className = 'tpl-star' + (fav ? ' on' : '');
+        starEl.dataset.fav = t.slug;
+        starEl.title = '收藏';
+        starEl.textContent = '★';
+        row.appendChild(checkEl);
+        row.appendChild(mainEl);
+        row.appendChild(starEl);
         row.addEventListener('click', e => {
           if (e.target.dataset.fav) return;
           e.stopPropagation();   // 避免重渲染后 document 的"外部点击"判断把面板关掉
@@ -314,8 +334,14 @@
     list.forEach(t => {
       const chip = document.createElement('span');
       chip.className = 'tpl-chip';
-      chip.innerHTML = '<span>' + t.name + '</span><b title="移除">×</b>';
-      chip.querySelector('b').addEventListener('click', () => toggleSlug(t.slug));
+      const chipName = document.createElement('span');
+      chipName.textContent = t.name;
+      const chipDel = document.createElement('b');
+      chipDel.title = '移除';
+      chipDel.textContent = '×';
+      chipDel.addEventListener('click', () => toggleSlug(t.slug));
+      chip.appendChild(chipName);
+      chip.appendChild(chipDel);
       chips.appendChild(chip);
     });
     if (!list.length) {

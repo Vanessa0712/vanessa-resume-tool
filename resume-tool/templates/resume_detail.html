@@ -8,7 +8,7 @@
     <p class="subtitle">导入时间 {{ r.imported_at.replace('T', ' ') }} · 文本长度 {{ r.text|length }} 字符</p>
   </div>
   <div class="head-actions">
-    <button class="btn btn-primary" type="button" id="preview-open" {{ '' if file_info.exists else 'disabled' }}>预览原文件</button>
+    <button class="btn btn-primary" type="button" id="preview-open" {{ '' if (file_info.exists and not deleted) else 'disabled' }}>预览原文件</button>
     <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
   </div>
 </div>
@@ -30,9 +30,12 @@
       <div class="file-path" title="{{ file_info.path }}">{{ file_info.path }}</div>
       <div class="hint" style="margin:4px 0 0">{{ file_info.ext or '无扩展名' }} · {{ file_info.size_kb }} KB</div>
     </div>
+    {% if not deleted %}
     <a class="btn btn-secondary btn-sm" href="{{ url_for('resume_raw', rid=r.id, download=1) }}">下载</a>
+    {% endif %}
   </div>
 
+  {% if not deleted %}
   <form method="post" action="{{ url_for('resume_open', rid=r.id) }}" class="open-row" id="open-form">
     <label class="form-label" for="open-method">打开方式</label>
     <select name="method" id="open-method">
@@ -45,7 +48,10 @@
   </form>
   <p class="hint">打开方式会调用本机程序（WPS / Word / 资源管理器），仅在 127.0.0.1 本地生效；云文档会复制文件路径并打开网盘网页，需自行上传</p>
   {% else %}
-  <div class="empty">原文件已不在原路径（可能被移动或删除）：{{ file_info.path }}<br>仍可查看下方已解析的文本内容</div>
+  <p class="hint">该简历在回收站中，恢复到简历库后才能预览、下载或用本机程序打开原文件。</p>
+  {% endif %}
+  {% else %}
+  <div class="empty">原文件不可用（可能已被移动、删除，或路径不在数据目录内）：{{ file_info.path or '（无有效路径记录）' }}<br>仍可查看下方已解析的文本内容</div>
   {% endif %}
 </div>
 
@@ -87,7 +93,7 @@
 </div>
 
 {# ---------- 原文件预览弹窗 ---------- #}
-{% if file_info.exists %}
+{% if file_info.exists and not deleted %}
 <div class="modal-mask" id="preview-modal" hidden>
   <div class="modal modal-preview">
     <div class="modal-head">

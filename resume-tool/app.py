@@ -101,6 +101,9 @@ def ensure_data_layout() -> None:
             if not path.name.startswith("."):
                 _copy_file_if_missing(path, TPL_DIR / path.name)
 
+    if os.environ.get("RESUME_TOOL_SKIP_MIGRATION") == "1":
+        return  # 测试环境：只建目录与内置模板，不把本机旧数据搬进来
+
     if DATA_DIR.resolve() == CODE_DIR.resolve():
         return
 
@@ -173,6 +176,20 @@ def protect_local_mutations():
 
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
+    {
+        "version": "ver1.2.4",
+        "channel": "Beta",
+        "date": "2026-11-14",
+        "title": "路径信任收紧与测试隔离",
+        "entries": [
+            "原文件访问统一限定在数据目录 uploads/ 内：绝对路径与 .. 穿越一律拒绝，备份包无法再借路径读走本机任意文件",
+            "回收站中的简历不再可导出或下载原件；xlsx 导出与详情页接口都会排除已删除记录",
+            "模板名、角色、技能等字段改为纯文本渲染，导入恶意模板无法再触发存储型 XSS",
+            "数据目录内（如 samples/）的历史原文件自动收进 uploads/legacy，收紧边界后仍可正常预览",
+            "恢复备份后自动净化越界路径；外部目录里同名 uploads 片段不再被误改写",
+            "测试改用独立临时数据目录，不再读写真实简历库；新增路径边界、软删除、历史文件迁移回归（31 项）",
+        ],
+    },
     {
         "version": "ver1.2.3",
         "channel": "Beta",
@@ -335,31 +352,125 @@ def close_db(_exc=None) -> None:
         conn.close()
 
 
-def stored_resume_path(raw: str) -> Path:
-    """把数据库中的路径解析为当前机器路径；uploads/... 为相对数据目录."""
-    path = Path(raw)
-    return path if path.is_absolute() else (DATA_DIR / path).resolve()
+def stored_resume_path(raw: str) -> Path | None:
+    """解析数据库中的路径；只接受数据目录 uploads/ 内的文件.
+
+    数据库可能来自备份包，属于不可信输入：绝对路径、`..` 穿越都必须最终落在
+    UPLOAD_DIR 之内，否则一律视为不可用，避免被用来读走本机任意文件。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = DATA_DIR / path
+    try:
+        resolved = path.resolve()
+        upload_root = UPLOAD_DIR.resolve()
+    except OSError:
+        return None
+    return resolved if resolved.is_relative_to(upload_root) else None
 
 
 def normalize_upload_paths(conn) -> int:
-    """把历史绝对路径中的 uploads/... 片段改为相对路径，便于换机和恢复."""
+    """把数据目录内的绝对路径改为 uploads/... 相对路径，便于换机和恢复.
+
+    只改写真正落在本机 UPLOAD_DIR 内的路径；外部目录里的 `.../uploads/...`
+    不再被误改写（那会导致预览 404，甚至指向另一份同名文件）。
+    """
     changed = 0
+    try:
+        root = UPLOAD_DIR.resolve()
+    except OSError:
+        return 0
     rows = conn.execute("SELECT id, path FROM resumes WHERE path IS NOT NULL").fetchall()
     for rid, raw_path in rows:
         raw = str(raw_path or "")
         path = Path(raw)
         if not path.is_absolute():
             continue
-        parts = list(path.parts)
         try:
-            idx = len(parts) - 1 - parts[::-1].index("uploads")
-        except ValueError:
+            resolved = path.resolve()
+        except OSError:
             continue
-        tail = parts[idx + 1:]
-        if not tail:
+        if not resolved.is_relative_to(root):
             continue
-        stored = Path("uploads", *tail).as_posix()
+        stored = Path("uploads", resolved.relative_to(root)).as_posix()
         conn.execute("UPDATE resumes SET path=? WHERE id=?", (stored, rid))
+        changed += 1
+    if changed:
+        conn.commit()
+    return changed
+
+
+def sanitize_resume_paths(conn) -> int:
+    """恢复后净化路径：只保留数据目录 uploads/ 内的文件，其余清空.
+
+    备份包里的数据库可能被人为写入 `C:\\Windows\\...` 之类的路径，
+    恢复后若原样留着，详情页与下载接口就会成为任意文件读取入口。
+    """
+    changed = 0
+    rows = conn.execute("SELECT id, path FROM resumes WHERE path IS NOT NULL").fetchall()
+    for rid, raw in rows:
+        if str(raw or "").strip() and stored_resume_path(raw) is None:
+            conn.execute("UPDATE resumes SET path='' WHERE id=?", (rid,))
+            changed += 1
+    if changed:
+        conn.commit()
+    return changed
+
+
+def adopt_legacy_files(conn) -> int:
+    """把数据目录内、但不在 uploads/ 的原文件复制进 uploads 并改为相对路径.
+
+    历史记录可能直接引用项目目录里的 samples/ 文件；收紧路径信任后这些记录
+    会失去预览。这里只处理确实位于 DATA_DIR 内且存在的文件，不碰用户目录之外。
+    """
+    changed = 0
+    try:
+        data_root = DATA_DIR.resolve()
+        upload_root = UPLOAD_DIR.resolve()
+    except OSError:
+        return 0
+    rows = conn.execute("SELECT id, path FROM resumes WHERE path IS NOT NULL").fetchall()
+    for rid, raw in rows:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_absolute():
+            path = DATA_DIR / path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved.is_relative_to(upload_root) or not resolved.is_relative_to(data_root):
+            continue
+        if not resolved.is_file():
+            continue
+        dest_dir = upload_root / "legacy"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        dest = dest_dir / resolved.name
+        try:
+            if not dest.exists():
+                shutil.copy2(resolved, dest)
+            elif dest.stat().st_size != resolved.stat().st_size:
+                n = 2
+                while True:
+                    candidate = dest_dir / f"{resolved.stem}-{n}{resolved.suffix}"
+                    if not candidate.exists():
+                        shutil.copy2(resolved, candidate)
+                        dest = candidate
+                        break
+                    n += 1
+        except OSError as exc:
+            app.logger.warning("迁移历史原文件失败 %s：%s", resolved, exc)
+            continue
+        conn.execute("UPDATE resumes SET path=? WHERE id=?",
+                     (Path("uploads", "legacy", dest.name).as_posix(), rid))
         changed += 1
     if changed:
         conn.commit()
@@ -712,6 +823,7 @@ def restore_backup(archive: Path) -> dict:
         path_conn = sqlite3.connect(DB)
         try:
             normalize_upload_paths(path_conn)
+            sanitize_resume_paths(path_conn)  # 备份包可能携带任意绝对路径
         finally:
             path_conn.close()
 
@@ -1328,14 +1440,14 @@ def resume_detail(rid: int):
     history = [dict(h) | {"detail": json.loads(h["detail"])} for h in history]
 
     src = stored_resume_path(row["path"])
-    ext = src.suffix.lower()
+    ext = (src.suffix if src else Path(row["filename"] or "").suffix).lower()
     file_info = {
-        "exists": src.is_file(),
-        "path": str(src),
+        "exists": bool(src and src.is_file()),
+        "path": str(src) if src else "",
         "ext": ext,
         # 浏览器能内嵌渲染的类型：PDF 原生，纯文本直接显示
         "inline": ext == ".pdf" or ext in {".txt", ".md", ".markdown"},
-        "size_kb": round(src.stat().st_size / 1024, 1) if src.is_file() else 0,
+        "size_kb": round(src.stat().st_size / 1024, 1) if src and src.is_file() else 0,
     }
     return render_template("resume_detail.html", r=row, history=history,
                            file_info=file_info, deleted=bool(row["deleted_at"]),
@@ -1358,13 +1470,17 @@ def _page_window(cur: int, pages: int, span: int = 2) -> list:
 
 @app.get("/resume/<int:rid>/raw")
 def resume_raw(rid: int):
-    """原文件字节流：浏览器预览用 inline，?download=1 时强制下载."""
+    """原文件字节流：浏览器预览用 inline，?download=1 时强制下载.
+
+    只允许在库（未进回收站）且路径在数据目录内的简历，避免回收站数据被继续下载。
+    """
     conn = db()
-    row = conn.execute("SELECT filename, path FROM resumes WHERE id=?", (rid,)).fetchone()
+    row = conn.execute("SELECT filename, path FROM resumes"
+                       " WHERE id=? AND deleted_at IS NULL", (rid,)).fetchone()
     if row is None:
         abort(404)
     src = stored_resume_path(row["path"])
-    if not src.is_file():
+    if src is None or not src.is_file():
         abort(404)
     return send_file(src, as_attachment=request.args.get("download") == "1",
                      download_name=row["filename"])
@@ -1408,12 +1524,13 @@ def _word_exe() -> str | None:
 def resume_open(rid: int):
     """用本机程序打开原文件（仅回环地址可访问，属本地桌面行为）."""
     conn = db()
-    row = conn.execute("SELECT filename, path FROM resumes WHERE id=?", (rid,)).fetchone()
+    row = conn.execute("SELECT filename, path FROM resumes"
+                       " WHERE id=? AND deleted_at IS NULL", (rid,)).fetchone()
     if row is None:
         abort(404)
     src = stored_resume_path(row["path"])
-    if not src.is_file():
-        flash(f"原文件不存在（可能已被移动或删除）：{src}", "error")
+    if src is None or not src.is_file():
+        flash("原文件不可用（可能已移动、删除，或不在数据目录内）", "error")
         return redirect(url_for("resume_detail", rid=rid))
 
     method = request.form.get("method", "default")
@@ -1509,16 +1626,8 @@ def _fts_forget(conn, ids: list[int]) -> None:
 
 
 def resume_file_on_disk(raw: str) -> Path | None:
-    """解析原文件路径；只有落在数据目录 uploads/ 内才视为可管理文件."""
-    raw = str(raw or "").strip()
-    if not raw:
-        return None
-    try:
-        resolved = stored_resume_path(raw).resolve()
-        root = UPLOAD_DIR.resolve()
-    except OSError:
-        return None
-    return resolved if resolved.is_relative_to(root) else None
+    """可安全访问的原文件；与 stored_resume_path 共用同一边界."""
+    return stored_resume_path(raw)
 
 
 def human_size(size: int) -> str:
@@ -1804,7 +1913,10 @@ def export_xlsx():
         f" (SELECT COUNT(*) FROM resumes r2 WHERE r2.person_id = r.person_id"
         f"  AND r2.deleted_at IS NULL) AS versions"
         f" FROM resumes r LEFT JOIN persons p ON p.id = r.person_id"
-        f" WHERE r.id IN ({marks})", ids).fetchall()}
+        f" WHERE r.id IN ({marks}) AND r.deleted_at IS NULL", ids).fetchall()}
+    if not rows:
+        flash("所选简历不存在或已移入回收站", "error")
+        return redirect(url_for("library"))
     latest = latest_map(conn, template=tpl_label)
 
     wb = Workbook()
@@ -2542,6 +2654,9 @@ def main() -> None:
         conn = rt.get_conn(DB)
         try:
             normalize_upload_paths(conn)
+            adopted = adopt_legacy_files(conn)
+            if adopted:
+                app.logger.info("已将 %s 份历史原文件复制进数据目录", adopted)
         finally:
             conn.close()
     except (OSError, sqlite3.DatabaseError) as exc:
