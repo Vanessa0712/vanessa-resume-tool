@@ -103,6 +103,31 @@
 </div>
 {% endif %}
 
+{# ---------- 通用确认弹窗 ----------
+   不用浏览器原生 confirm()：一旦用户勾过「阻止此页面创建更多对话框」，
+   confirm 会直接返回 false 且不显示，删除等操作会静默失效。
+   统一走页面内弹窗，任何浏览器设置下都有明确反馈。 #}
+<div class="modal-mask" id="confirm-modal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" id="confirm-title">请确认</div>
+        <div class="modal-sub" id="confirm-sub"></div>
+      </div>
+      <button class="modal-x" type="button" data-close="confirm-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-body"></p>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-foot-actions">
+        <button class="btn btn-secondary" type="button" data-close="confirm-modal">取消</button>
+        <button class="btn btn-danger" type="button" id="confirm-ok">确认</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
   // 供 app.js 使用的服务端常量
   window.RT = {

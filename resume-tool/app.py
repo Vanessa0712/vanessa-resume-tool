@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -34,6 +35,7 @@ import zipfile
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import (
     Flask, abort, flash, g, has_app_context, redirect, render_template, request,
@@ -132,8 +134,39 @@ def ensure_data_layout() -> None:
 
 ensure_data_layout()
 
+
+def _load_or_create_secret_key(path: Path) -> str:
+    """读取或生成持久化随机会话密钥；文件不进入备份和诊断包."""
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    except OSError as exc:
+        raise RuntimeError(f"无法读取会话密钥文件 {path}：{exc}") from exc
+    if len(existing) >= 32:
+        return existing
+
+    value = secrets.token_urlsafe(48)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(value, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass  # Windows ACL 由用户配置；原子替换仍然有效
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise RuntimeError(f"无法写入随机会话密钥 {path}：{exc}") from exc
+    return value
+
+
 app = Flask(__name__)
-app.secret_key = "resume-tool-local-dev"  # 本地原型，无跨用户场景
+_configured_secret = os.environ.get("RESUME_TOOL_SECRET_KEY", "").strip()
+if _configured_secret and len(_configured_secret) < 32:
+    raise RuntimeError("RESUME_TOOL_SECRET_KEY 至少需要 32 个字符")
+app.secret_key = (_configured_secret or
+                  _load_or_create_secret_key(CONFIG_DIR / ".flask_secret_key"))
 app.config["TEMPLATES_AUTO_RELOAD"] = True  # UI 迭代期模板改动即时生效，无需重启
 # 只接受回环地址的 Host，阻断 DNS rebinding；本应用仅面向 127.0.0.1 单机使用。
 app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "127.0.0.1:5000", "localhost:5000"]
@@ -169,168 +202,77 @@ def protect_local_mutations():
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     allowed = {request.host_url.rstrip("/"), "http://127.0.0.1:5000", "http://localhost:5000"}
-    origin = (request.headers.get("Origin") or "").rstrip("/")
+    origin_header = request.headers.get("Origin")
+    referer = request.headers.get("Referer") or ""
+    if not origin_header and not referer:
+        # 本机页面写操作也应带来源；两者都缺失时不再默认放行跨站表单。
+        abort(403)
+    origin = (origin_header or "").rstrip("/")
     if origin and origin not in allowed:
         abort(403)
-    referer = request.headers.get("Referer") or ""
     if referer and not any(referer.startswith(base + "/") for base in allowed):
         abort(403)
     return None
 
+
+_URL_QUERY_VALUE_RE = re.compile(r"([?&][A-Za-z_][A-Za-z0-9_]*=)[^&\s\"']+")
+
+
+def redact_log_text(text: str) -> str:
+    """打包日志前脱敏：清掉查询参数值、手机、邮箱、身份证与银行卡.
+
+    诊断包对外承诺不含候选人个人信息，而日志里的搜索词可能正是姓名
+    （例如 `GET /?q=张三`），因此必须先在文本层清掉再写入压缩包。
+    """
+    out = _URL_QUERY_VALUE_RE.sub(r"\1***", text or "")
+    out = rt._PHONE_RE.sub("[手机]", out)
+    out = rt._EMAIL_RE.sub("[邮箱]", out)
+    out = rt._ID_CARD_RE.sub("[证件]", out)   # 先于银行卡：身份证也是 18 位数字
+    out = rt._BANK_CARD_RE.sub("[卡号]", out)
+    return out
+
+
+@app.after_request
+def log_access(response):
+    """记录每次请求：waitress 不提供访问日志，用户报问题时可回溯操作.
+
+    查询参数只记名称不记取值——搜索词往往是候选人姓名，落盘即泄露。
+    """
+    if not app.config.get("TESTING") and not request.path.startswith("/static/"):
+        keys = ",".join(sorted(request.args.keys()))
+        suffix = f"?{keys}" if keys else ""
+        app.logger.info("%s %s%s -> %s", request.method, request.path, suffix,
+                        response.status_code)
+    return response
+
+
+@app.after_request
+def set_security_headers(response):
+    """本机页面同样按不可嵌入处理，切断点击劫持到敏感写操作的链路."""
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
     {
-        "version": "ver1.2.5",
-        "channel": "Beta",
-        "date": "2026-11-16",
-        "title": "恢复事务化、删除可恢复与并发闸门",
-        "entries": [
-            "恢复备份改为「临时库 + 原子替换」：任一步失败都不会覆盖现有数据库，提示改为「当前数据库未被替换」",
-            "彻底删除与孤立文件清理改为移入 .trash 暂存区，保留 30 天后自动清除，误点可找回",
-            "上传与目录导入改为先写 .partial 再原子改名；孤立文件扫描跳过 10 分钟内的新文件，避免误删正在导入的简历",
-            "同一时间只允许一个筛选任务，防止连点造成重复调用与并发写库；任务状态读取改为返回副本",
-            "依赖锁定 flask>=3.1,<4（Host 白名单需要 3.1+），默认使用 waitress 提供 Web 服务",
-            "CLI 与 Web 共用同一数据目录，Agent 协作写回的结果在界面上直接可见",
-        ],
-    },
-    {
-        "version": "ver1.2.4",
-        "channel": "Beta",
-        "date": "2026-11-14",
-        "title": "路径信任收紧与测试隔离",
-        "entries": [
-            "原文件访问统一限定在数据目录 uploads/ 内：绝对路径与 .. 穿越一律拒绝，备份包无法再借路径读走本机任意文件",
-            "回收站中的简历不再可导出或下载原件；xlsx 导出与详情页接口都会排除已删除记录",
-            "模板名、角色、技能等字段改为纯文本渲染，导入恶意模板无法再触发存储型 XSS",
-            "数据目录内（如 samples/）的历史原文件自动收进 uploads/legacy，收紧边界后仍可正常预览",
-            "恢复备份后自动净化越界路径；外部目录里同名 uploads 片段不再被误改写",
-            "测试改用独立临时数据目录，不再读写真实简历库；新增路径边界、软删除、历史文件迁移回归（31 项）",
-        ],
-    },
-    {
-        "version": "ver1.2.3",
-        "channel": "Beta",
-        "date": "2026-11-14",
-        "title": "筛选中心记住模板选择",
-        "entries": [
-            "筛选中心勾选的模板自动记住，重启程序或第二天打开自动恢复，不用反复重选",
-            "勾选变化即时保存，不运行筛选也会记住；开始筛选时同样写入",
-            "模板被删除或改名后自动从记忆中剔除，不会出现无效选择",
-            "应用设置改为原子写入，避免异常退出留下半截配置文件",
-        ],
-    },
-    {
-        "version": "ver1.2.2",
-        "channel": "Beta",
-        "date": "2026-11-14",
-        "title": "隐私清理、运行日志与诊断包",
-        "entries": [
-            "彻底删除简历时同步清理数据目录内的原始文件；数据目录之外的历史文件不会被擅自删除，只提示",
-            "设置页新增「清理孤立原文件」：找出重复导入留下的副本并释放磁盘空间，已导入简历的文件不受影响",
-            "运行日志写入数据目录 logs/，按 2MB 滚动保留 5 份，打包成无控制台程序后仍能排查现场问题",
-            "页面异常显示错误编号并写入日志，便于按编号定位",
-            "设置页新增「导出诊断包」：环境、数据规模统计、脱敏配置和最近日志，不含简历正文与 API Key",
-        ],
-    },
-    {
-        "version": "ver1.2.1",
-        "channel": "Beta",
-        "date": "2026-11-14",
-        "title": "数据可移植与企业可用性",
-        "entries": [
-            "数据目录与安装目录分离：打包后默认使用 LOCALAPPDATA，支持环境变量指定并自动迁移旧数据",
-            "目录导入与上传文件统一复制进数据目录，数据库改存 uploads 相对路径；备份换机后原文件仍可打开",
-            "全新机器可直接从备份恢复，不再要求目标机器先有数据库",
-            "设置页新增数据备份与恢复：一致性快照、可选原始文件、每日自动备份、恢复前备份",
-            "每次导入生成批次记录，逐文件展示新增、恢复、重复、无法解析和异常原因",
-            "AI/漏斗提交前确认预计调用量；修复导出重复、CSV 口径、配置锁死与后台任务卡死",
-        ],
-    },
-    {
-        "version": "ver1.2.0",
-        "channel": "Beta",
-        "date": "2026-11-14",
-        "title": "综合设置与 WorkBuddy Agent 协作筛选",
-        "entries": [
-            "侧边栏「AI 设置」升级为综合「设置」，集中管理通用选项、AI 厂商与版本更新",
-            "设置页新增「检查更新」：读取版本 manifest，比对版本并展示更新说明与安装包下载地址",
-            "新增 Agent 协作筛选接口：导出脱敏批次给 WorkBuddy Agent 评估，再写回结果库，无需 API Key",
-            "配套 resume-tool-agent 技能可一键驱动完整筛选流程，评估额度记在使用者自己的 WorkBuddy 账号",
-        ],
-    },
-    {
-        "version": "ver1.1.1",
-        "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "品牌区换新：新图标 + 引擎说明",
-        "entries": [
-            "侧边栏左上角换用新图标：纸面 + 陶土色镜片 + 通过对勾，浏览器标签页图标同步更新",
-            "品牌文字精简为单行英文 RESUME TOOL，与图标视觉居中；原中文名与副标题移除",
-            "侧边栏页脚改为引擎说明：「基于双引擎开发 / 本地关键词 · AI 语义评估」，与筛选中心引擎命名一致",
-            "AI 设置页新增数据流向说明：关键词引擎全程离线，AI 引擎会把简历正文发送至所选厂商接口",
-        ],
-    },
-    {
-        "version": "ver1.1.0",
-        "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "视觉升级（A 阶段）：暖纸风格主题 + 内嵌中文字体",
-        "entries": [
-            "全站换用暖纸 + 珊瑚主色视觉语言：米白画布、白色圆角卡片、胶囊按钮、浅色侧边栏",
-            "内嵌 Noto Serif SC 子集（6763 汉字 · 400/600 两档 · 约 2.7MB），标题不再回退宋体，离线可用",
-            "图表配色统一为暖色系（草绿 / 琥珀 / 砖红 / 珊瑚），去掉荧光蓝紫",
-            "修复筛选中心「提交前提示」始终显示「请至少勾选一个模板」的问题",
-        ],
-    },
-    {
-        "version": "ver1.0.3",
-        "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "筛选模板改为可搜索多选（部门分组 + 收藏）",
-        "entries": [
-            "模板选择从卡片墙改为可搜索多选框：输入模板名或技能即时过滤，已选项以 chip 展示、可单个移除",
-            "模板支持「部门 + 子职业」两级归属（人事 / 电气 / 业务 / IT），下拉按部门分组展示",
-            "支持 ★ 收藏，收藏项置顶显示；常用组合会记入「最近使用」",
-            "已选模板旁显示 AI 调用量预估（模板数 × 简历数），避免误选过多模板",
-            "支持键盘操作：↑↓ 移动、Enter 选中、Backspace 删除最后一个 chip、Esc 收起",
-        ],
-    },
-    {
-        "version": "ver1.0.2",
-        "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "新增更新日志入口与历史公告页",
-        "entries": [
-            "侧边栏新增「更新日志」入口，有未读版本时显示 NEW 标识，看完即消失",
-            "更新日志页以卡片展示全部历史公告，可逐条展开/收起，当前版本默认展开",
-            "进入时的公告弹窗底部新增「查看历史更新」，可直接跳到完整记录",
-        ],
-    },
-    {
-        "version": "ver1.0.1",
-        "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "Beta 迭代：候选人聚合与 xlsx 报告导出",
-        "entries": [
-            "同一人的多份简历自动归并为一个候选人（按 邮箱 → 手机 → 姓名 匹配），列表显示最新版本与版本数",
-            "点候选人姓名进入版本页，可横向对比新旧版本、单独查看详情，并导出该候选人的 xlsx",
-            "新增「导出 xlsx 报告」：姓名/联系方式/版本数/双引擎评分/命中技能/判定说明，带表头冻结、筛选与汇总页",
-            "可「导出所选」，导出跟随当前搜索词与模板口径",
-        ],
-    },
-    {
         "version": "ver1.0.0",
         "channel": "Beta",
-        "date": "2026-11-12",
-        "title": "Beta 首发：本地双引擎简历筛选工具",
+        "date": "2026-11-16",
+        "title": "Beta 1.0.0：安全加固与筛选口径更新",
         "entries": [
-            "批量导入 doc / docx / pdf / txt，按内容哈希去重，自动识别姓名与联系方式",
-            "双引擎筛选：本地关键词（离线、秒级）+ 多家 AI 接口（OpenAI 兼容协议），支持分级漏斗降本",
-            "筛选模板可视化编辑、批量导入导出（JSON / ZIP）",
-            "一次勾选多个模板做综合筛选，结果按模板分组；筛选在后台运行并显示进度",
-            "正文全文搜索（中文按字切分），支持按模板查看与多条件叠加",
-            "图表视图：状态分布、分数分布、模板通过率、技能命中、导入趋势",
-            "回收站（删除可恢复）、主列表与筛选历史分页、原文件预览与多种打开方式",
+            "本地双引擎：关键词离线秒筛（提及即视为具备，核心技能全覆盖不再被压到 36 分）+ AI 语义评估，支持分级漏斗降本",
+            "批量导入 doc / docx / pdf / txt，按内容哈希去重，自动识别姓名、手机与邮箱；同一人多版本自动聚合",
+            "模板可视化编辑与批量导入导出，一次勾选多个模板后台筛选；全文搜索、图表视图与 CSV / xlsx 报告导出",
+            "简历库新增「建议复核」：同一模板下两引擎分差 ≥ 20 分时行内标注，详情页给出双方理由，便于区分漏判与推断过头",
+            "AI 地址仅允许 HTTPS 与官方域名（自定义地址必须是公网端点），实际请求前复查 DNS 并禁止重定向；修改地址必须重填 Key",
+            "页面禁止被 iframe 嵌入（XFO + CSP frame-ancestors），会话密钥改为随机持久化，写请求校验同源来源",
+            "启动裁剪历史前强制生成独立 pre-trim 快照，快照失败不删除任何记录；恢复备份时先备份现存原件再覆盖",
+            "导出 CSV / xlsx 统一转义 = + - @ 等公式前缀；清除筛选历史先存档 JSON 快照（保留 30 天），任务运行中拒绝清除",
+            "简历库列表由三次全表扫描合并为一次并补 created_at 索引，3 万条筛选记录下列表约 0.14 秒返回",
+            "数据目录与安装目录分离，支持一致性备份、每日自动备份与恢复；删除移入 .trash 暂存 30 天可找回",
         ],
     },
 ]
@@ -544,6 +486,33 @@ def list_templates() -> list[dict]:
     return items
 
 
+def list_deleted_templates() -> list[dict]:
+    """暂存区里可恢复的模板（`.trash/templates-*`），供模板管理页展示.
+
+    删除模板不直接 unlink：误删一个做了很久的岗位模板，重做成本很高。
+    """
+    items: list[dict] = []
+    try:
+        folders = sorted(TRASH_DIR.glob("templates-*"), reverse=True)
+    except OSError:
+        return items
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.json")):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            items.append({
+                "slug": path.stem,
+                "name": path.name,
+                "folder": folder.name,
+                "deleted_at": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+    return items
+
+
 def get_favorites() -> list[str]:
     favs = load_app_settings().get("favorites", [])
     return [s for s in favs if isinstance(s, str) and template_path(s) is not None]
@@ -588,8 +557,18 @@ def save_screen_templates(slugs: list[str]) -> list[str]:
     return valid
 
 
-def latest_map(conn, template: str | None = None) -> dict[int, dict[str, dict]]:
+def latest_map(conn, template: str | None = None,
+               snapshot: dict | None = None) -> dict[int, dict[str, dict]]:
     """每份简历每个引擎的最新一次筛选结果（可选按模板过滤）."""
+    if snapshot is not None:
+        if not template:
+            return snapshot["latest"]
+        out: dict[int, dict[str, dict]] = {}
+        for rid, per in snapshot["groups"].items():
+            engines = per.get(template)
+            if engines:
+                out[rid] = engines
+        return out
     sql = "SELECT * FROM screenings"
     params: tuple = ()
     if template:
@@ -641,7 +620,9 @@ def save_app_settings(data: dict) -> None:
 # ---------- 备份与恢复 ----------
 
 def _safe_backup_name(name: str) -> bool:
-    return bool(re.fullmatch(r"resume-tool-(?:auto|manual|pre-restore)-\d{8}-\d{6}(?:-\d+)?\.zip", name or ""))
+    return bool(re.fullmatch(
+        r"resume-tool-(?:auto|manual|pre-restore|pre-trim)-\d{8}-\d{6}(?:-\d+)?\.zip",
+        name or ""))
 
 
 def list_backups() -> list[dict]:
@@ -652,8 +633,9 @@ def list_backups() -> list[dict]:
         if not _safe_backup_name(path.name):
             continue
         stat = path.stat()
-        kind = "自动" if "-auto-" in path.name else (
-            "恢复前" if "-pre-restore-" in path.name else "手动")
+        kind = ("自动" if "-auto-" in path.name else
+                "恢复前" if "-pre-restore-" in path.name else
+                "裁剪前" if "-pre-trim-" in path.name else "手动")
         size_kb = stat.st_size / 1024
         size_text = (f"{size_kb:.0f} KB" if size_kb < 1024
                      else f"{size_kb / 1024:.1f} MB")
@@ -667,8 +649,8 @@ def list_backups() -> list[dict]:
 
 
 def _prune_backups() -> None:
-    """自动备份保留 7 份、恢复前备份 3 份、手动备份 20 份."""
-    groups = {"auto": 7, "pre-restore": 3, "manual": 20}
+    """自动备份保留 7 份、恢复前/裁剪前各 3 份、手动备份 20 份."""
+    groups = {"auto": 7, "pre-restore": 3, "pre-trim": 3, "manual": 20}
     for kind, keep in groups.items():
         files = sorted(BACKUP_DIR.glob(f"resume-tool-{kind}-*.zip"), reverse=True)
         for path in files[keep:]:
@@ -751,6 +733,31 @@ def maybe_auto_backup() -> Path | None:
     if any(f"resume-tool-auto-{today}" in p.name for p in BACKUP_DIR.glob("*.zip")):
         return None
     return create_backup("auto", include_uploads=False)
+
+
+def trim_history_with_backup() -> tuple[int, str]:
+    """启动裁剪前先做独立快照；快照失败直接抛错，不删除任何历史.
+
+    不能依赖每日自动备份：它可能已被关闭，或当天早已生成；这里仅在确实
+    存在超限记录时创建 pre-trim 备份，保证被裁掉的记录始终可回滚。
+    """
+    if not Path(DB).is_file():
+        return 0, ""
+    conn = rt.get_conn(DB)
+    try:
+        needed = rt.history_trim_needed(conn)
+    finally:
+        conn.close()
+    if not needed:
+        return 0, ""
+
+    archive = create_backup("pre-trim", include_uploads=False)
+    conn = rt.get_conn(DB)
+    try:
+        trimmed = rt.trim_all_history(conn)
+    finally:
+        conn.close()
+    return trimmed, archive.name
 
 
 def backup_file(name: str) -> Path | None:
@@ -880,13 +887,35 @@ def restore_backup(archive: Path) -> dict:
                     tmp = dest.with_name(dest.name + ".restore-tmp")
                     tmp.write_bytes(raw)
                     if name == "config/providers.json":
-                        rt.read_providers(tmp)  # 结构不合法就抛错，避免覆盖成坏配置
+                        restored_providers = rt.read_providers(tmp)  # 结构不合法就拒绝覆盖
+                        for provider_name, spec in restored_providers["providers"].items():
+                            # 备份可能来自不可信来源：地址可保留供人工核对，但 Key 必须重新输入。
+                            spec["api_key"] = ""
+                            restored_url = spec.get("base_url", "")
+                            if restored_url:
+                                try:
+                                    spec["base_url"] = rt.validate_provider_base_url(
+                                        restored_url, provider_name)
+                                except rt.ProviderConfigError:
+                                    spec["base_url"] = ""
+                        rt.write_providers(tmp, restored_providers)
+                        warnings.append(
+                            "AI 配置已恢复，但所有 API Key 已清空；请在设置页核对地址并重新输入")
                 except (OSError, ValueError, rt.ProviderConfigError) as exc:
                     warnings.append(f"{name} 未恢复：{exc}")
                     continue
                 config_stage.append((tmp, dest))
 
-            # 4) 原始文件先复制（同名覆盖），失败只记警告，不影响数据库切换
+            # 4) 恢复前快照必须早于任何 uploads 写入：zip 内含现库与现存原件。
+            #    若先覆盖再备份，pre-restore 里留下的是「已被备份包覆盖」的文件，
+            #    同一备份恢复两次就会把两次之间改动的原件永久吃掉。
+            if db_path.is_file():
+                try:
+                    pre = create_backup("pre-restore", include_uploads=bool(upload_entries))
+                except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                    raise ValueError(f"恢复前备份失败，已取消恢复，现有数据未改动：{exc}") from exc
+
+            # 5) 原始文件复制（同名覆盖），失败只记警告，不影响数据库切换
             if upload_entries:
                 with zipfile.ZipFile(archive) as zf:
                     for rel, info in upload_entries:
@@ -902,9 +931,7 @@ def restore_backup(archive: Path) -> dict:
                             upload_failed += 1
                             app.logger.warning("恢复原文件失败 %s：%s", rel, exc)
 
-            # 5) 现库备份 + 关连接 + 去掉旁路文件，最后一步原子替换
-            if db_path.is_file():
-                pre = create_backup("pre-restore", include_uploads=False)
+            # 6) 关连接 + 去掉旁路文件，最后一步原子替换
             conn = g.pop("db_conn", None)
             if conn is not None:
                 conn.close()
@@ -920,7 +947,7 @@ def restore_backup(archive: Path) -> dict:
             os.replace(staging, DB)
             swapped = True
 
-            # 6) 数据库已切换，再落配置；配置失败不回滚数据库，但要说清楚
+            # 7) 数据库已切换，再落配置；配置失败不回滚数据库，但要说清楚
             for tmp, dest in config_stage:
                 try:
                     os.replace(tmp, dest)
@@ -1192,6 +1219,15 @@ def job_get(jid: str | None) -> dict | None:
         return copy.deepcopy(job) if job is not None else None
 
 
+def active_job() -> dict | None:
+    """当前排队/运行中的筛选任务；用于删除类操作的前置互斥检查."""
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("state") in ("queued", "running"):
+                return dict(job)
+    return None
+
+
 def job_update(jid: str, **kw) -> None:
     with JOBS_LOCK:
         if jid in JOBS:
@@ -1318,6 +1354,116 @@ def _latest_status(conn, resume_id: int, tpl_name_: str) -> str | None:
     return row["status"] if row else None
 
 
+REVIEW_GAP = 20.0
+"""双引擎分差达到该值即标注「建议复核」。
+
+关键词分衡量技能覆盖率（有分母、缺项归零），AI 分衡量整体合格度
+（无分母、通常压缩在 68-92）。两者是两把尺子，算术平均会把真实缺项
+稀释成「中等」——例如覆盖率 52、AI 75 平均成 63.5 就会掩盖缺 35% 核心技能。
+所以这里只做分歧提示，不合并分数。
+"""
+
+
+def diff_flag(engines: dict, gap: float = REVIEW_GAP) -> dict | None:
+    """判断同一模板下双引擎结果的分歧程度；缺任一引擎或分差不足返回 None.
+
+    调用方必须保证两个结果来自同一模板——跨模板比较（如 A 模板的关键词分
+    对上 B 模板的 AI 分）会把口径差异和岗位差异混在一起，得到的提示没有意义。
+    """
+    kw, ai = engines.get("keyword"), engines.get("ai")
+    if not kw or not ai:
+        return None
+    if kw.get("template") and ai.get("template") and kw["template"] != ai["template"]:
+        return None
+    try:
+        k, a = float(kw["score"]), float(ai["score"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if a - k >= gap:
+        return {"gap": round(a - k, 1), "higher": "ai"}
+    if k - a >= gap:
+        return {"gap": round(k - a, 1), "higher": "keyword"}
+    return None
+
+
+def screening_snapshot(conn) -> dict[str, dict]:
+    """一次全表扫描，同时产出「按(简历,模板)分组」与「每引擎最新」两份视图.
+
+    列表页原先分别调用 latest_map / template_groups / divergence_map，同一张
+    screenings 表被完整扫三遍（3 万条时约 0.5 s）。这里只扫一次，三个派生物都
+    取自同一份快照，排序语义保持 `ORDER BY created_at, id`——后写覆盖先写，等价
+    于「按时间取最新」，也避免两次扫描之间任务写入导致口径不一致。
+    """
+    groups: dict[int, dict[str, dict[str, dict]]] = {}
+    latest: dict[int, dict[str, dict]] = {}
+    for row in conn.execute("SELECT * FROM screenings ORDER BY created_at, id").fetchall():
+        item = dict(row)
+        rid = item["resume_id"]
+        groups.setdefault(rid, {}).setdefault(item["template"], {})[item["engine"]] = item
+        latest.setdefault(rid, {})[item["engine"]] = item
+    return {"groups": groups, "latest": latest}
+
+
+def template_groups(conn, snapshot: dict | None = None) -> dict[int, dict[str, dict[str, dict]]]:
+    """{简历ID: {模板名: {引擎: 该模板下最新一次结果}}}.
+
+    列表页在「全部模板」视图下必须按模板成对取数：关键词分来自 A 模板、
+    AI 分来自 B 模板，会把岗位差异混进口径差异，行内两列也就失去可比性。
+    """
+    if snapshot is not None:
+        return snapshot["groups"]
+    out: dict[int, dict[str, dict[str, dict]]] = {}
+    for row in conn.execute("SELECT * FROM screenings ORDER BY created_at, id").fetchall():
+        out.setdefault(row["resume_id"], {}).setdefault(row["template"], {})[row["engine"]] = dict(row)
+    return out
+
+
+def _newest_template(per: dict[str, dict[str, dict]]) -> str | None:
+    """多个模板都有结果时，取最近一条筛选记录所属的模板作为展示口径."""
+    best_tpl, best_id = None, -1
+    for tpl_key, engines in per.items():
+        for result in engines.values():
+            if result["id"] > best_id:
+                best_id, best_tpl = result["id"], tpl_key
+    return best_tpl
+
+
+def _display_template(per: dict[str, dict[str, dict]], flag: dict | None) -> str | None:
+    """「全部模板」视图下这份简历该展示哪个模板的结果.
+
+    优先级：分歧所在模板（保证行内数字与气泡一致）→ 双引擎齐全的模板（信息最完整）
+    → 最近一次筛选的模板。只按「最新」取会踩坑：批量重算多个模板后，恰好最后
+    跑的那个模板会覆盖全部行，后端简历显示成测试岗的分数。
+    """
+    if flag and flag.get("template"):
+        return flag["template"]
+    both = [t for t, e in per.items() if "keyword" in e and "ai" in e]
+    if both:
+        return max(both, key=lambda t: max(x["id"] for x in per[t].values()))
+    return _newest_template(per)
+
+
+def divergence_map(conn, template: str | None = None,
+                   snapshot: dict | None = None) -> dict[int, dict]:
+    """每份简历最严重的一次双引擎分歧，按 (简历, 模板) 分组后各取最新一次.
+
+    列表页「建议复核」用它：先按模板分组，再比同一模板下的两个引擎，
+    避免「全部模板」视图把 A 模板的关键词分和 B 模板的 AI 分凑成一对。
+    """
+    out: dict[int, dict] = {}
+    for rid, per in template_groups(conn, snapshot=snapshot).items():
+        for tpl_key, engines in per.items():
+            if template and tpl_key != template:
+                continue
+            flag = diff_flag(engines)
+            if flag and flag["gap"] > out.get(rid, {}).get("gap", -1):
+                # 带上产生分歧的那一对分数：「全部模板」视图下行内两列可能来自别的模板
+                out[rid] = {**flag, "template": tpl_key,
+                            "kw_score": engines["keyword"]["score"],
+                            "ai_score": engines["ai"]["score"]}
+    return out
+
+
 # ---------- 路由：简历库 ----------
 
 @app.get("/")
@@ -1331,6 +1477,13 @@ def library():
     else:
         tpl_filter = "all"
     q = request.args.get("q", "").strip()
+    # 一次全表扫描，供「每引擎最新」「按模板分组」「分歧判定」共用
+    snapshot = screening_snapshot(conn)
+    # 每份简历每引擎的最新结果：统计口径（不区分展示模板）
+    latest = latest_map(conn, template=tpl_label, snapshot=snapshot)
+    # 展示与分歧判定按 (简历, 模板) 成对取数，避免两列来自不同模板
+    groups = snapshot["groups"]
+    flags = divergence_map(conn, template=tpl_label, snapshot=snapshot)
 
     # 先取「范围内全部简历 ID」（搜索命中按相关度排序，否则按导入倒序）
     if q:
@@ -1339,6 +1492,13 @@ def library():
         ids = [r["id"] for r in conn.execute(
             "SELECT id FROM resumes WHERE deleted_at IS NULL ORDER BY id DESC").fetchall()]
 
+    # 双引擎分歧清单：计数基于全量匹配结果，「只看建议复核」只收窄列表不动统计
+    review_ids = [rid for rid in ids if rid in flags]
+    all_ids = ids
+    review_only = request.args.get("review") == "1"
+    if review_only:
+        ids = review_ids
+
     per_page = 15
     total = len(ids)
     pages = max(1, (total + per_page - 1) // per_page)
@@ -1346,10 +1506,9 @@ def library():
     page = min(max(1, page), pages)
     page_ids = ids[(page - 1) * per_page: page * per_page]
 
-    # 统计基于全量匹配结果（不只看当前页），模板口径可选
-    latest = latest_map(conn, template=tpl_label)
-    stats = {"total": total, "通过": 0, "待核实": 0, "未通过": 0, "未筛选": 0}
-    for rid in ids:
+    # 统计基于全量匹配结果（不只看当前页，也不受「只看建议复核」过滤影响），模板口径可选
+    stats = {"total": len(all_ids), "通过": 0, "待核实": 0, "未通过": 0, "未筛选": 0}
+    for rid in all_ids:
         best = (latest.get(rid, {}).get("ai") or latest.get(rid, {}).get("keyword"))
         stats[best["status"] if best else "未筛选"] += 1
 
@@ -1364,10 +1523,15 @@ def library():
             r = rows.get(rid)
             if r is None:
                 continue
-            engines = latest.get(rid, {})
-            best = engines.get("ai") or engines.get("keyword")
+            per = groups.get(rid, {})
+            if tpl_label:
+                per = {tpl_label: per[tpl_label]} if tpl_label in per else {}
+            # 展示口径：优先分歧模板，其次双引擎齐全的模板（详见 _display_template）
+            picked = _display_template(per, flags.get(rid))
+            engines = per.get(picked, {})
             item = dict(r) | {"keyword": engines.get("keyword"), "ai": engines.get("ai"),
-                              "best_template": best["template"] if best else None,
+                              "best_template": picked,
+                              "review": flags.get(rid),
                               "snippet": rt.make_snippet(r["text"], q) if q else ""}
             item.pop("text", None)  # 列表页不传全文
             resumes.append(item)
@@ -1378,6 +1542,8 @@ def library():
                            templates=templates, tpl_filter=tpl_filter,
                            tpl_label=tpl_label, trash_count=trash_count,
                            q=q, matched=len(ids),
+                           review_only=review_only, review_count=len(review_ids),
+                           review_gap=REVIEW_GAP,
                            pager_info={"page": page, "pages": pages, "total": total,
                                   "per_page": per_page,
                                   "window": _page_window(page, pages)},
@@ -1542,6 +1708,27 @@ def resume_detail(rid: int):
     ).fetchall()
     history = [dict(h) | {"detail": json.loads(h["detail"])} for h in history]
 
+    # 双引擎分歧：按模板分组取各自最新一次，供详情页解释「为什么建议复核」
+    review_flags = []
+    by_tpl: dict[str, dict] = {}
+    for s in conn.execute(
+        "SELECT * FROM screenings WHERE resume_id=? ORDER BY created_at, id", (rid,)
+    ).fetchall():
+        by_tpl.setdefault(s["template"], {})[s["engine"]] = dict(s)
+    for tpl_key, engines in by_tpl.items():
+        flag = diff_flag(engines)
+        if flag:
+            kw_detail = json.loads(engines["keyword"]["detail"])
+            ai_detail = json.loads(engines["ai"]["detail"])
+            review_flags.append({
+                "template": tpl_key, **flag,
+                "keyword": engines["keyword"]["score"],
+                "ai": engines["ai"]["score"],
+                "kw_reason": kw_detail.get("reason", ""),
+                "ai_reason": ai_detail.get("reason", ""),
+            })
+    review_flags.sort(key=lambda x: -x["gap"])
+
     src = stored_resume_path(row["path"])
     ext = (src.suffix if src else Path(row["filename"] or "").suffix).lower()
     file_info = {
@@ -1554,6 +1741,10 @@ def resume_detail(rid: int):
     }
     return render_template("resume_detail.html", r=row, history=history,
                            file_info=file_info, deleted=bool(row["deleted_at"]),
+                           review_flags=review_flags,
+                           review_gap=REVIEW_GAP,
+                           score_ruleset=rt.SCORE_RULESET,
+                           trash_days=TRASH_RETENTION_DAYS,
                            pager_info={"page": page, "pages": pages, "total": total,
                                   "per_page": per_page,
                                   "window": _page_window(page, pages)},
@@ -1667,30 +1858,91 @@ def resume_open(rid: int):
     return redirect(url_for("resume_detail", rid=rid))
 
 
+def _same_origin_back(fallback: str) -> str:
+    """操作完成后回到来源页，保留搜索词、模板筛选与页码.
+
+    只接受同源 Referer 的 path+query，不跟随外部站点，避免开放重定向。
+    """
+    ref = request.referrer or ""
+    if ref:
+        parsed = urlsplit(ref)
+        if parsed.netloc == request.host:
+            target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            if target.startswith("/") and not target.startswith("//"):
+                return target
+    return fallback
+
+
 @app.post("/resume/<int:rid>/delete")
 def resume_delete(rid: int):
     """软删除：移入回收站，可在 /trash 恢复."""
     conn = db()
-    conn.execute("UPDATE resumes SET deleted_at=? WHERE id=? AND deleted_at IS NULL",
-                 (rt.now(), rid))
+    cur = conn.execute("UPDATE resumes SET deleted_at=? WHERE id=? AND deleted_at IS NULL",
+                       (rt.now(), rid))
     conn.commit()
-    flash(f"已将简历 #{rid} 移入回收站（可在回收站恢复）")
-    return redirect(url_for("library"))
+    back = _same_origin_back(url_for("library"))
+    if cur.rowcount:
+        flash(f"已将简历 #{rid} 移入回收站（可在回收站恢复）")
+    elif conn.execute("SELECT 1 FROM resumes WHERE id=?", (rid,)).fetchone() is None:
+        # 记录已不存在（可能已被彻底删除或另一个标签页处理过），不能提示"已删除"
+        flash(f"简历 #{rid} 已不存在，可能已被彻底删除；列表已刷新", "error")
+        back = url_for("library")
+    else:
+        flash(f"简历 #{rid} 已在回收站中，无需重复删除", "error")
+    return redirect(back)
+
+
+@app.post("/resume/<int:rid>/history/clear")
+def resume_history_clear(rid: int):
+    """清除该简历的筛选历史：先存档快照，再删除（简历本体与原始文件不受影响）.
+
+    只删 screenings，不动 resumes：历史可由重新筛选重建，而简历文本和文件不可重建。
+    快照写失败时坚决不删；有任务在跑时直接拒绝，避免把正在写入的结果删掉一半。
+    """
+    conn = db()
+    row = conn.execute("SELECT filename FROM resumes WHERE id=?", (rid,)).fetchone()
+    if row is None:
+        abort(404)
+    back = _same_origin_back(url_for("resume_detail", rid=rid)) + "#history"
+    if active_job() is not None:
+        flash("仍有筛选任务在运行，历史可能正在写入；请等待任务结束后再清除", "error")
+        return redirect(back)
+    rows = conn.execute(
+        "SELECT * FROM screenings WHERE resume_id=? ORDER BY created_at, id", (rid,)).fetchall()
+    if not rows:
+        flash(f"#{rid} 本就没有筛选历史，无需清除", "error")
+        return redirect(back)
+    try:
+        snapshot = save_history_snapshot(rid, row["filename"], rows)
+    except OSError as exc:
+        app.logger.warning("历史快照写入失败，已取消清除：%s", exc)
+        flash(f"未能生成历史快照，已取消清除（历史未改动）：{exc}", "error")
+        return redirect(back)
+    cur = conn.execute("DELETE FROM screenings WHERE resume_id=?", (rid,))
+    conn.commit()
+    flash(f"已清除 #{rid} 的 {cur.rowcount} 条筛选历史；快照存于 .trash/{snapshot.name}/"
+          f"{HISTORY_SNAPSHOT_FILE}（保留 {TRASH_RETENTION_DAYS} 天，简历本体未受影响）")
+    return redirect(back)
 
 
 @app.post("/resume/batch-delete")
 def resume_batch_delete():
     ids = [int(x) for x in request.form.getlist("ids") if x.isdigit()]
+    back = _same_origin_back(url_for("library"))
     if not ids:
         flash("未选择任何简历", "error")
-        return redirect(url_for("library"))
+        return redirect(back)
     conn = db()
     marks = ",".join("?" * len(ids))
-    conn.execute(f"UPDATE resumes SET deleted_at=? WHERE id IN ({marks}) AND deleted_at IS NULL",
-                 [rt.now(), *ids])
+    cur = conn.execute(
+        f"UPDATE resumes SET deleted_at=? WHERE id IN ({marks}) AND deleted_at IS NULL",
+        [rt.now(), *ids])
     conn.commit()
-    flash(f"已将 {len(ids)} 份简历移入回收站（可在回收站恢复）")
-    return redirect(url_for("library"))
+    if cur.rowcount:
+        flash(f"已将 {cur.rowcount} 份简历移入回收站（可在回收站恢复）")
+    else:
+        flash("所选简历已不在库中（可能已在回收站或已被彻底删除）", "error")
+    return redirect(back)
 
 
 # ---------- 路由：回收站 ----------
@@ -1839,6 +2091,42 @@ def purge_old_trash(days: int = TRASH_RETENTION_DAYS) -> tuple[int, int]:
         except OSError as exc:
             app.logger.warning("清理暂存区失败 %s：%s", entry, exc)
     return removed, freed
+
+
+HISTORY_SNAPSHOT_FILE = "screenings.json"
+
+
+def save_history_snapshot(rid: int, filename: str, rows) -> Path:
+    """清除历史前，把待删记录写入暂存区快照；写盘失败抛 OSError.
+
+    目录与模板删除的 `.trash/templates-*` 同构，因此沿用 `purge_old_trash` 的
+    保留期自动清理。调用方必须先拿到快照、再执行 DELETE——快照失败就放弃删除，
+    避免「报告只导最新一条、中间历史删掉即无从恢复」。
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = TRASH_DIR / f"history-{rid}-{stamp}"
+    n = 2
+    while target.exists():
+        target = TRASH_DIR / f"history-{rid}-{stamp}-{n}"
+        n += 1
+    target.mkdir(parents=True)
+    payload = {
+        "resume_id": rid,
+        "filename": filename,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "count": len(rows),
+        "screenings": [dict(r) for r in rows],
+    }
+    path = target / HISTORY_SNAPSHOT_FILE
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    return target
 
 
 def _purge_message(filename: str, moved: int, kept: int) -> str:
@@ -2126,7 +2414,7 @@ def export_xlsx():
             evidence = json.loads(kw["detail"]).get("evidence", {})
         skills = "、".join(f"{k}×{v}" for k, v in
                            sorted(evidence.items(), key=lambda kv: -kv[1])) or ""
-        ws.append([
+        line = [
             rid, r["person_name"] or "", r["phone"] or "", r["email"] or "",
             r["filename"], r["versions"] or 1, best["template"] if best else "",
             kw["status"] if kw else "", kw["score"] if kw else "",
@@ -2134,7 +2422,9 @@ def export_xlsx():
             skills,
             json.loads(best["detail"]).get("reason", "") if best else "",
             (r["imported_at"] or "").replace("T", " "),
-        ])
+        ]
+        # 文件名/AI 理由都是外部输入：以 = + - @ 开头会被 Excel 当公式执行
+        ws.append([rt.sanitize_spreadsheet_cell(v) for v in line])
         for col in (8, 10):
             cell = ws.cell(row=ws.max_row, column=col)
             if cell.value in fills:
@@ -2159,7 +2449,7 @@ def export_xlsx():
         ("未筛选", counts.get("未筛选", 0)),
     ]
     for k, v in meta:
-        summary.append([k, v])
+        summary.append([k, rt.sanitize_spreadsheet_cell(v)])
     summary.column_dimensions["A"].width = 16
     summary.column_dimensions["B"].width = 34
 
@@ -2301,7 +2591,9 @@ def screen_job(jid: str):
 @app.get("/templates")
 def templates_page():
     return render_template("templates.html", templates=list_templates(),
-                           favorites=get_favorites(), active="templates")
+                           favorites=get_favorites(),
+                           deleted_templates=list_deleted_templates(),
+                           trash_days=TRASH_RETENTION_DAYS, active="templates")
 
 
 @app.get("/templates/<slug>")
@@ -2413,6 +2705,68 @@ def template_export(slug: str):
         abort(404)
     return send_file(path, as_attachment=True, download_name=f"{slug}.json",
                      mimetype="application/json")
+
+
+@app.post("/templates/<slug>/delete")
+def template_delete(slug: str):
+    """删除模板：移入 `.trash/templates-<时间戳>/`，30 天内可在模板管理页恢复."""
+    path = template_path(slug)
+    if path is None:
+        flash("模板不存在或已被删除", "error")
+        return redirect(url_for("templates_page"))
+
+    dest_dir = TRASH_DIR / f"templates-{datetime.now():%Y%m%d-%H%M%S}"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest_dir / path.name))
+    except OSError as exc:
+        app.logger.warning("删除模板失败 %s：%s", path, exc)
+        flash(f"删除失败：{exc}", "error")
+        return redirect(url_for("templates_page"))
+
+    # 收藏与筛选中心的记忆里若还留着这个 slug，会指向已不存在的模板
+    cfg = load_app_settings()
+    changed = False
+    for key in ("favorites", "screen_templates"):
+        values = cfg.get(key)
+        if isinstance(values, list) and slug in values:
+            cfg[key] = [s for s in values if s != slug]
+            changed = True
+    if changed:
+        save_app_settings(cfg)
+
+    app.logger.info("删除模板 %s（移入 %s）", slug, dest_dir.name)
+    flash(f"已删除模板「{slug}」；历史筛选记录保留，但不再按该模板查看。"
+          f"如需找回，在下方「最近删除」里恢复（{TRASH_RETENTION_DAYS} 天内有效）")
+    return redirect(url_for("templates_page"))
+
+
+@app.post("/templates/<slug>/restore")
+def template_restore(slug: str):
+    """从暂存区恢复被删除的模板；不覆盖同名现有模板."""
+    folder = request.form.get("folder", "")
+    if not re.fullmatch(r"templates-\d{8}-\d{6}", folder or ""):
+        flash("恢复参数无效", "error")
+        return redirect(url_for("templates_page"))
+    dest = template_dest(slug)
+    if dest is None:
+        flash("模板文件名只允许小写字母/数字/连字符", "error")
+        return redirect(url_for("templates_page"))
+    src = TRASH_DIR / folder / f"{slug}.json"
+    if not src.is_file():
+        flash("该模板已不在暂存区，可能已被自动清理", "error")
+        return redirect(url_for("templates_page"))
+    if dest.exists():
+        flash(f"{slug}.json 已存在，未覆盖；可先重命名现有模板再恢复", "error")
+        return redirect(url_for("templates_page"))
+    try:
+        shutil.move(str(src), str(dest))
+    except OSError as exc:
+        app.logger.warning("恢复模板失败 %s：%s", src, exc)
+        flash(f"恢复失败：{exc}", "error")
+        return redirect(url_for("templates_page"))
+    flash(f"已恢复模板「{slug}」")
+    return redirect(url_for("templates_page"))
 
 
 @app.get("/templates-export-all")
@@ -2675,7 +3029,9 @@ def settings_diagnostics():
         logs = sorted(LOG_DIR.glob("resume-tool.log*"))[-3:] if LOG_DIR.is_dir() else []
         for path in logs:
             try:
-                zf.write(path, f"logs/{path.name}")
+                # 日志先脱敏再入包：历史日志里可能留着搜索词等个人信息
+                zf.writestr(f"logs/{path.name}",
+                            redact_log_text(path.read_text(encoding="utf-8", errors="replace")))
             except OSError:
                 continue
         zf.writestr(
@@ -2792,12 +3148,26 @@ def settings_save():
         repaired = f"原配置无法读取（{exc}）{backup}，已用缺省配置重建。"
 
     data["active"] = request.form.get("active", data.get("active", ""))
-    for name, spec in data.get("providers", {}).items():
-        for field in ("label", "base_url", "model"):
-            spec[field] = request.form.get(f"{name}__{field}", spec.get(field, "")).strip()
-        key = request.form.get(f"{name}__api_key", "").strip()
-        if key:  # 留空表示不修改已保存的 Key
-            spec["api_key"] = key
+    try:
+        for name, spec in data.get("providers", {}).items():
+            old_url = spec.get("base_url", "")
+            submitted_url = request.form.get(
+                f"{name}__base_url", old_url).strip()
+            base_url = (rt.validate_provider_base_url(submitted_url, name)
+                        if submitted_url else "")
+            key = request.form.get(f"{name}__api_key", "").strip()
+            if base_url != old_url and spec.get("api_key") and not key:
+                raise rt.ProviderConfigError(
+                    f"厂商 {name} 修改 Base URL 后必须重新输入 API Key，配置未保存")
+            for field in ("label", "model"):
+                spec[field] = request.form.get(
+                    f"{name}__{field}", spec.get(field, "")).strip()
+            spec["base_url"] = base_url
+            if key:  # 地址未变时留空才不修改；地址变化已在上方强制重填
+                spec["api_key"] = key
+    except rt.ProviderConfigError as exc:
+        flash(f"检测到不安全的 AI 厂商配置，未保存：{exc}", "error")
+        return redirect(url_for("settings"))
     rt.write_providers(PROVIDERS_PATH, data)
     flash(repaired + "AI 厂商配置已保存", "error" if repaired else "message")
     return redirect(url_for("settings"))
@@ -2861,6 +3231,15 @@ def main() -> None:
                 app.logger.info("已生成每日自动备份：%s", backup.name)
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:
             app.logger.warning("自动备份失败，不影响应用启动：%s", exc)
+    try:
+        trimmed, pre_trim = trim_history_with_backup()
+        if trimmed:
+            app.logger.info(
+                "筛选历史按每简历 %s 条收敛，清理 %s 条；裁剪前快照 %s",
+                rt.HISTORY_WINDOW, trimmed, pre_trim)
+    except Exception as exc:  # 启动维护不可阻断应用；备份失败时历史仍未删除
+        app.logger.warning(
+            "历史裁剪未执行，超限记录已保留（不影响启动）：%s", exc)
     # 单机桌面用途：只绑定回环地址，关闭 reloader（打包 exe 的硬性要求）
     try:
         from waitress import serve

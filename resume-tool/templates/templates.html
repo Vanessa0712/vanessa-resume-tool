@@ -53,8 +53,43 @@
     <div class="tpl-actions">
       <a class="btn btn-primary btn-sm" href="{{ url_for('template_edit', slug=t.slug) }}">编辑模板</a>
       <a class="btn btn-secondary btn-sm" href="{{ url_for('template_export', slug=t.slug) }}">导出 JSON</a>
+      <form method="post" action="{{ url_for('template_delete', slug=t.slug) }}" class="inline"
+            data-confirm-title="删除模板"
+            data-confirm-sub="移入暂存区，可在本页恢复"
+            data-confirm-body="删除模板「{{ t.name }}」？已有的筛选记录会保留，但列表与筛选中不再能按该模板查看。"
+            data-confirm-ok="删除">
+        <button class="btn btn-danger-ghost btn-sm" type="submit">删除</button>
+      </form>
     </div>
   </div>
   {% endfor %}
 </div>
+
+{% if deleted_templates %}
+<div class="card">
+  <div class="card-title">最近删除
+    <span class="muted">（暂存区内，{{ trash_days }} 天内可恢复）</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>模板文件</th><th>删除时间</th><th class="th-actions">操作</th></tr></thead>
+      <tbody>
+        {% for d in deleted_templates %}
+        <tr>
+          <td class="muted">{{ d.name }}</td>
+          <td class="muted">{{ d.deleted_at }}</td>
+          <td class="td-actions">
+            <form method="post" action="{{ url_for('template_restore', slug=d.slug) }}" class="inline">
+              <input type="hidden" name="folder" value="{{ d.folder }}">
+              <button class="btn btn-xs" type="submit">恢复</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint">恢复不会覆盖同名模板；若模板名已被占用，先给现有模板改名再恢复。</p>
+</div>
+{% endif %}
 {% endblock %}

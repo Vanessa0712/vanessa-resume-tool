@@ -35,13 +35,16 @@ import csv
 import hashlib
 import html as html_mod
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -283,15 +286,28 @@ def count_evidence(text: str, rule: SkillRule) -> int:
     return sum(_count_keyword(text, alias) for alias in rule.aliases)
 
 
+SCORE_RULESET = 2
+"""评分口径版本，写入 screenings.detail 以便区分历史记录。
+
+1 = 旧口径：提及 1 次只计 40%，2-3 次计 80%
+2 = 现口径：提及即视为具备（1 次 80%），次数仅做微调
+"""
+
+
 def evidence_to_score(count: int) -> float:
-    """证据次数 → 0-5 分：0=未提及 1=仅罗列 2-3=用过 4+=深度实践."""
+    """证据次数 → 0-1 强度系数（口径 2）：提及即视为具备，次数只做小幅加权.
+
+    旧口径把「提及 1 次」算成 0.40，等于假设候选人只在简历里罗列过技能。
+    实测后果：一份核心技能全覆盖、但每项只写一遍的简历，核心分理论上限
+    只有 36 分，与 AI 判定的 75 分相差近 50 分，且两个数字并排展示时无法解释。
+    """
     if count <= 0:
         return 0.0
     if count == 1:
-        return 2.0
+        return 0.80
     if count <= 3:
-        return 4.0
-    return 5.0
+        return 0.90
+    return 1.00
 
 
 _YEAR_PATTERNS = (
@@ -335,7 +351,7 @@ def screen_keyword(text: str, tpl: Template) -> dict:
         total = sum(r.weight for r in rules)
         if total <= 0:
             return 0.0
-        return sum(evidence_to_score(evidence[r.name]) / 5.0 * r.weight for r in rules) / total
+        return sum(evidence_to_score(evidence[r.name]) * r.weight for r in rules) / total
 
     score = (
         round(_weighted(tpl.core_skills) * 90 + _weighted(tpl.nice_to_have) * 10, 1)
@@ -347,6 +363,7 @@ def screen_keyword(text: str, tpl: Template) -> dict:
         "reason": "；".join(reasons) if reasons else "符合硬性门槛",
         "evidence": {k: v for k, v in evidence.items() if v > 0},
         "years": years,
+        "ruleset": SCORE_RULESET,
     }
 
 
@@ -362,6 +379,88 @@ AI_SYSTEM_PROMPT = (
 
 class ProviderConfigError(ValueError):
     """AI 厂商配置缺失或格式错误；Web 层应展示提示而不是退出进程."""
+
+
+_PROVIDER_HOST_ALLOWLIST = {
+    "deepseek": frozenset({"api.deepseek.com"}),
+    "moonshot": frozenset({"api.moonshot.cn"}),
+}
+
+
+def _require_public_address(raw: str) -> None:
+    """拒绝回环、内网、链路本地、组播、保留及其他非公网地址."""
+    try:
+        address = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError as exc:
+        raise ProviderConfigError("AI Base URL 的 IP 地址无效") from exc
+    if not address.is_global:
+        raise ProviderConfigError("AI Base URL 不允许指向回环、内网或元数据等非公网地址")
+
+
+def validate_provider_base_url(base_url: str, provider_name: str = "custom",
+                               resolve: bool = False) -> str:
+    """校验并规范化 OpenAI 兼容端点，返回可安全拼接的 Base URL.
+
+    内置厂商使用精确主机白名单；自定义厂商只允许 HTTPS 公网端点。
+    实际调用时设置 resolve=True，所有 DNS 结果都必须为公网地址。
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ProviderConfigError("AI Base URL 不能为空")
+    raw = base_url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError as exc:
+        raise ProviderConfigError("AI Base URL 格式不安全或无法解析") from exc
+    if parsed.scheme.lower() != "https":
+        raise ProviderConfigError("AI Base URL 仅允许使用 HTTPS")
+    if not host or parsed.username is not None or parsed.password is not None:
+        raise ProviderConfigError("AI Base URL 主机无效，且不允许携带用户名或密码")
+    if port not in (None, 443):
+        raise ProviderConfigError("AI Base URL 仅允许默认 HTTPS 端口 443")
+    if parsed.query or parsed.fragment or "\\" in raw:
+        raise ProviderConfigError("AI Base URL 不允许查询参数、片段或反斜杠")
+    if any(part in (".", "..") for part in parsed.path.split("/")):
+        raise ProviderConfigError("AI Base URL 路径不安全")
+
+    allowed_hosts = _PROVIDER_HOST_ALLOWLIST.get(provider_name)
+    if allowed_hosts is not None:
+        if host not in allowed_hosts:
+            raise ProviderConfigError("内置 AI 厂商的 Base URL 主机不在官方白名单内")
+    else:
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            if host == "localhost" or host.endswith((".localhost", ".local")):
+                raise ProviderConfigError("AI Base URL 不允许指向本机或局域网主机")
+            if resolve:
+                try:
+                    answers = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+                except socket.gaierror as exc:
+                    raise ProviderConfigError("AI Base URL 主机无法解析，已停止请求") from exc
+                addresses = {item[4][0] for item in answers if item[4]}
+                if not addresses:
+                    raise ProviderConfigError("AI Base URL 主机没有可用地址，已停止请求")
+                for address in addresses:
+                    _require_public_address(address)
+        else:
+            _require_public_address(host)
+
+    path = parsed.path.rstrip("/")
+    display_host = f"[{host}]" if ":" in host else host
+    netloc = display_host + (":443" if port == 443 else "")
+    return urllib.parse.urlunsplit(("https", netloc, path, "", ""))
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """AI 请求禁止跳转，避免官方/公网端点把 Authorization 带去其他主机."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_AI_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 def default_providers() -> dict:
@@ -454,7 +553,9 @@ def _parse_ai_json(raw: str) -> dict | None:
 
 def call_llm(provider: dict, user_prompt: str, timeout_s: int = 90) -> str:
     """POST {base_url}/chat/completions（OpenAI 兼容协议，urllib 标准库实现）."""
-    url = provider["base_url"].rstrip("/") + "/chat/completions"
+    base_url = validate_provider_base_url(
+        provider.get("base_url", ""), provider.get("name", "custom"), resolve=True)
+    url = base_url + "/chat/completions"
     payload = {
         "model": provider["model"],
         "temperature": 0.1,
@@ -473,7 +574,7 @@ def call_llm(provider: dict, user_prompt: str, timeout_s: int = 90) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _AI_OPENER.open(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as exc:
@@ -528,11 +629,18 @@ AGENT_INSTRUCTIONS = (
 
 
 def mask_pii(text: str, name: str | None) -> str:
-    """Agent 批次导出前脱敏：打码手机/邮箱/姓名，降低进入对话上下文的隐私面."""
+    """批次导出前降低隐私面：打码手机、邮箱、身份证、银行卡与已识别姓名.
+
+    注意：这是**降低**隐私暴露面，不是彻底匿名化。姓名只按已抽取的那一种写法打码，
+    简历里若出现拼音、英文名或昵称，无法覆盖；工作经历等内容仍会进入会话上下文。
+    """
     out = _PHONE_RE.sub("[手机已打码]", text or "")
     out = _EMAIL_RE.sub("[邮箱已打码]", out)
-    if name and len(name) >= 2:
-        out = out.replace(name, "[姓名已打码]")
+    out = _ID_CARD_RE.sub("[证件已打码]", out)   # 先于银行卡：身份证也是 18 位数字
+    out = _BANK_CARD_RE.sub("[卡号已打码]", out)
+    pattern = _name_regex(name) if name else None
+    if pattern is not None:
+        out = pattern.sub("[姓名已打码]", out)
     return out
 
 
@@ -679,6 +787,11 @@ def _migrate(conn: sqlite3.Connection, key: str = "") -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_deleted ON resumes(deleted_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_person ON resumes(person_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_screenings_tpl ON screenings(template, resume_id)")
+    # 列表页按 created_at, id 顺序取每引擎最新结果；详情页按简历取历史。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_screenings_created ON screenings(created_at, id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_screenings_resume_created"
+        " ON screenings(resume_id, created_at)")
 
     # 状态枚举改名：淘汰 → 未通过（含 detail JSON 内的 status）
     if conn.execute("SELECT 1 FROM screenings WHERE status='淘汰' LIMIT 1").fetchone():
@@ -706,7 +819,26 @@ def _migrate(conn: sqlite3.Connection, key: str = "") -> None:
 
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?86[-\s]?)?(1[3-9]\d{9})(?!\d)")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# 18 位身份证：地区码 + 合法出生日期 + 顺序码 + 校验位（末位可为 X）
+# 校验日期段是为了避免把 18 位流水号误判为证件号
+_ID_CARD_RE = re.compile(
+    r"(?<![0-9A-Za-z])\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
+    r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9A-Za-z])")
+# 银行卡：16-19 位，允许每 4 位用空格或短横分隔
+_BANK_CARD_RE = re.compile(r"(?<!\d)(?:\d{4}[ -]?){3,4}\d{1,4}(?!\d)")
 _NAME_SPLIT = re.compile(r"[\s\-–—|｜,，:：/、()（）]+")
+
+
+def _name_regex(name: str) -> re.Pattern | None:
+    """姓名匹配式：允许字与字之间出现空格、间隔号或短横（张 三 / 张·三）.
+
+    不加前后边界是有意为之——宁可把「张三丰」多打一次码，也不要漏掉「张 三」。
+    """
+    chars = [c for c in (name or "").strip() if not c.isspace()]
+    if len(chars) < 2:
+        return None
+    body = r"[\s\u00b7·\-]{0,3}".join(re.escape(c) for c in chars)
+    return re.compile(body)
 
 
 def _guess_name(filename: str, text: str) -> str | None:
@@ -875,6 +1007,62 @@ def make_snippet(text: str, query: str, width: int = 80) -> str:
     return ("…" if start > 0 else "") + s + ("…" if end < len(text) else "")
 
 
+HISTORY_WINDOW = 30
+"""每份简历保留的筛选历史条数上限（先进先出）.
+
+单纯按时间截断会先删掉最贵的记录：AI 结果是 API 额度换来的、无法重建，
+关键词结果本地秒级可重跑；而 AI 结果的时间位次往往落在窗口边缘
+（实测 80 条里排第 17，再做 3 次四模板全量筛选就会被挤出窗口）。
+因此每个 (模板, 引擎) 的最新一条永远保留——界面上的双引擎对比与
+「建议复核」只依赖这一条，锚定它之后窗口怎么裁都不会破坏功能。
+"""
+
+
+def trim_history(conn: sqlite3.Connection, resume_id: int,
+                 limit: int = HISTORY_WINDOW) -> int:
+    """把某份简历的筛选历史裁剪到 limit 条，返回删除条数.
+
+    保留集 = 最新 limit 条 ∪ 每个 (模板, 引擎) 的最新一条。
+    """
+    rows = conn.execute(
+        "SELECT id, template, engine FROM screenings WHERE resume_id=?"
+        " ORDER BY created_at DESC, id DESC", (resume_id,)
+    ).fetchall()
+    if len(rows) <= limit:
+        return 0
+
+    keep = {r["id"] for r in rows[:limit]}
+    seen: set[tuple[str, str]] = set()
+    for r in rows:  # 已按时间倒序，每个键第一次出现即该组最新一条
+        key = (r["template"], r["engine"])
+        if key not in seen:
+            seen.add(key)
+            keep.add(r["id"])
+
+    drop = [(r["id"],) for r in rows if r["id"] not in keep]
+    if not drop:
+        return 0
+    conn.executemany("DELETE FROM screenings WHERE id=?", drop)
+    return len(drop)
+
+
+def history_trim_needed(conn: sqlite3.Connection, limit: int = HISTORY_WINDOW) -> bool:
+    """是否存在超限历史；用于避免无删除需求时仍生成启动备份."""
+    return conn.execute(
+        "SELECT 1 FROM screenings GROUP BY resume_id HAVING COUNT(*) > ? LIMIT 1",
+        (limit,)).fetchone() is not None
+
+
+def trim_all_history(conn: sqlite3.Connection, limit: int = HISTORY_WINDOW) -> int:
+    """启动时一次性收敛历史存量，返回删除条数（幂等，无超限记录时不写库）."""
+    total = 0
+    for row in conn.execute("SELECT DISTINCT resume_id FROM screenings").fetchall():
+        total += trim_history(conn, int(row["resume_id"]), limit)
+    if total:
+        conn.commit()
+    return total
+
+
 def _save_screening(conn: sqlite3.Connection, resume_id: int, engine: str,
                     tpl_name: str, result: dict) -> None:
     conn.execute(
@@ -883,6 +1071,7 @@ def _save_screening(conn: sqlite3.Connection, resume_id: int, engine: str,
         (resume_id, engine, tpl_name, result["score"], result["status"],
          json.dumps(result, ensure_ascii=False), now()),
     )
+    trim_history(conn, resume_id)  # 与插入同事务：窗口外的旧记录随写随清
     conn.commit()
 
 
@@ -1079,6 +1268,22 @@ def cmd_screen(args: argparse.Namespace) -> int:
     return 0
 
 
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+"""电子表格会把这些前缀解释为公式或控制字符，导出前必须转义."""
+
+
+def sanitize_spreadsheet_cell(value):
+    """把可能被 Excel/WPS 当成公式的字符串前缀转成纯文本.
+
+    简历文件名、AI 理由、搜索词都来自外部输入：`=HYPERLINK(...)` 这类内容
+    直接写进 xlsx 会成为活公式，写进 CSV 后双击打开同样会被求值。统一加
+    单引号前缀（OWASP CSV Injection 的常规处置），非字符串与空值原样返回。
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_LEAD):
+        return "'" + value
+    return value
+
+
 def build_report_csv(conn: sqlite3.Connection, ids: list[int] | None = None,
                      template: str | None = None) -> str:
     """生成 CSV 文本；ids 保持传入顺序，template 只取指定模板的最新结果."""
@@ -1123,14 +1328,15 @@ def build_report_csv(conn: sqlite3.Connection, ids: list[int] | None = None,
             suggestion = "建议 AI 复核(需配置 API)或人工"
         else:
             suggestion = "未通过"
-        writer.writerow([
+        line = [
             row["id"], row["filename"],
             kw["status"] if kw else "-", kw["score"] if kw else "-",
             kw_detail.get("reason", "-") if kw else "-",
             ai["status"] if ai else "-", ai["score"] if ai else "-",
             json.loads(ai["detail"]).get("reason", "") if ai else "-",
             suggestion,
-        ])
+        ]
+        writer.writerow([sanitize_spreadsheet_cell(v) for v in line])
     return buf.getvalue()
 
 

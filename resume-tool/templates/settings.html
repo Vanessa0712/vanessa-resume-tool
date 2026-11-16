@@ -24,7 +24,7 @@
 <div class="card" id="general">
   <div class="card-title">通用设置</div>
   <form method="post" action="{{ url_for('settings_preview') }}">
-    <div class="form-grid">
+    <div class="form-grid cols-2">
       <div class="field">
         <label>默认打开方式</label>
         <select name="preview_method">
@@ -38,15 +38,25 @@
         <input type="text" name="cloud_url" value="{{ app_settings.cloud_url }}"
                placeholder="https://docs.qq.com/desktop">
       </div>
-      <div class="field">
-        <label>更新偏好</label>
-        <label><input type="checkbox" name="auto_check_updates"
-               {{ 'checked' if app_settings.auto_check_updates }}> 每次启动应用时自动检查更新</label>
-      </div>
-      <div class="field">
-        <label>备份偏好</label>
-        <label><input type="checkbox" name="auto_backup"
-               {{ 'checked' if app_settings.auto_backup }}> 每天首次启动时自动备份数据库和配置</label>
+      <div class="pref-grid">
+        <label class="pref-item">
+          <input type="checkbox" name="auto_check_updates"
+                 {{ 'checked' if app_settings.auto_check_updates }}>
+          <span class="pref-mark" aria-hidden="true"></span>
+          <span class="pref-text">
+            <span class="pref-title">启动时自动检查更新</span>
+            <span class="pref-desc">后台比对 GitHub 正式 Release，不阻塞启动</span>
+          </span>
+        </label>
+        <label class="pref-item">
+          <input type="checkbox" name="auto_backup"
+                 {{ 'checked' if app_settings.auto_backup }}>
+          <span class="pref-mark" aria-hidden="true"></span>
+          <span class="pref-text">
+            <span class="pref-title">每天首次启动时自动备份</span>
+            <span class="pref-desc">备份数据库与配置，自动备份保留 7 份</span>
+          </span>
+        </label>
       </div>
     </div>
     <p class="hint">启动检查在后台进行，失败不影响使用；GitHub latest 只返回正式 Release，不含草稿和预发布版本</p>
@@ -80,7 +90,10 @@
 
     <form class="backup-panel" method="post" action="{{ url_for('settings_restore') }}"
           enctype="multipart/form-data"
-          onsubmit="return confirm('恢复备份会覆盖当前简历库和配置。系统会先自动备份当前数据，是否继续？')">
+          data-confirm-title="从文件恢复"
+          data-confirm-sub="会覆盖当前简历库和配置"
+          data-confirm-body="系统会先把当前数据自动备份一份，然后再覆盖。确定继续？"
+          data-confirm-ok="恢复">
       <div>
         <div class="backup-panel-title">从文件恢复</div>
         <p class="hint">选择本应用生成的 .zip 或 .db 备份；恢复前会自动保留当前数据。</p>
@@ -113,7 +126,10 @@
             <div class="backup-row-actions">
               <a class="btn btn-xs" href="{{ url_for('settings_backup_download', name=b.name) }}">下载</a>
               <form method="post" action="{{ url_for('settings_backup_restore_existing', name=b.name) }}"
-                    onsubmit="return confirm('用这个备份覆盖当前简历库和配置？系统会先自动备份当前数据。')">
+                    data-confirm-title="恢复此备份"
+                    data-confirm-sub="会覆盖当前简历库和配置"
+                    data-confirm-body="用「{{ b.name }}」覆盖当前数据？系统会先自动备份当前数据。"
+                    data-confirm-ok="恢复">
                 <button class="btn btn-xs btn-danger-ghost" type="submit">恢复</button>
               </form>
             </div>
@@ -130,7 +146,7 @@
 
 <div class="card" id="diagnostics">
   <div class="card-title">运行诊断与存储清理</div>
-  <p class="hint">需要请人协助排查时，导出诊断包即可：内含环境信息、数据规模统计和最近运行日志，不含简历正文、个人信息和 API Key。</p>
+  <p class="hint">需要请人协助排查时，导出诊断包即可：内含环境信息、数据规模统计和最近运行日志。日志入包前会先脱敏（搜索词、手机、邮箱、证件号与银行卡号均打码），不含简历正文、候选人个人信息和 API Key。</p>
   <p class="backup-path"><b>运行日志：</b><code>{{ log_file }}</code></p>
 
   <div class="backup-grid">
@@ -145,7 +161,10 @@
     </div>
 
     <form class="backup-panel" method="post" action="{{ url_for('settings_uploads_clean') }}"
-          onsubmit="return confirm('把未被任何简历引用的原文件移入 .trash 暂存区？30 天内可恢复，已导入简历的原文件不受影响。')">
+          data-confirm-title="清理孤立原文件"
+          data-confirm-sub="移入暂存区，30 天内可恢复"
+          data-confirm-body="把未被任何简历引用的 {{ orphan_count }} 个原文件移入 .trash 暂存区？已导入简历的原文件不受影响。"
+          data-confirm-ok="清理">
       <div>
         <div class="backup-panel-title">清理孤立原文件</div>
         <p class="hint">
@@ -196,7 +215,7 @@
       <div class="field"><label>Base URL</label>
         <input type="text" name="{{ name }}__base_url" value="{{ spec.get('base_url', '') }}"
                placeholder="https://your-api.example.com/v1"></div>
-      <div class="field"><label>API Key<span class="muted">（留空表示不修改）</span></label>
+      <div class="field"><label>API Key<span class="muted">（地址不变可留空；修改 Base URL 必须重新输入）</span></label>
         <input type="password" name="{{ name }}__api_key" placeholder="{{ '已保存，输入新值可替换' if spec.get('api_key') else 'sk-...' }}"
                autocomplete="off"></div>
       <div class="field"><label>模型</label>

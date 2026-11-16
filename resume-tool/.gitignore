@@ -1,0 +1,28 @@
+# 运行时数据（含候选人简历原文，严禁入库）
+resume_tool.db
+resume_tool.db-journal
+uploads/
+backups/
+logs/
+report.csv
+server.log
+
+# Agent 协作的临时批次文件（含脱敏后的简历内容）
+agent-*.json
+
+# 本机配置（含 API Key / 厂商偏好，每人各自配置）
+config/providers.json
+config/app_settings.json
+
+# 打包产物与缓存
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 删除暂存区（原始文件暂存 30 天）
+.trash/
+
+# UI 验收截图：本地留存，不入库
+ui-preview/

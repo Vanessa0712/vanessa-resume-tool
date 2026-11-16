@@ -63,7 +63,7 @@ Designed for distribution to office staff who have no API key of their own: **AI
 # 1) Keyword pre-screen (or use --all to export everything)
 python resume_tool.py screen --engine keyword --template config/template.json
 
-# 2) Export the "needs review" batch (text is redacted: name / phone / email masked)
+# 2) Export the "needs review" batch (text is redacted: name / phone / email / ID number / bank card masked)
 python resume_tool.py agent-export --template config/template.json --out agent-batch.json
 
 # 3) In WorkBuddy, tell the Agent: read agent-batch.json, follow its instructions,
@@ -77,7 +77,7 @@ python resume_tool.py agent-import --in agent-results.json --template config/tem
 - Once written back, the Web UI report page / CSV / xlsx exports display the results **with no code changes**
 - `agent-export --all` exports everything; `--ids 1,3,5` exports specific records; by default only resumes marked "needs review" by the keyword pre-screen are exported (i.e. a human-powered replacement for funnel stage 2)
 - This mode is unrelated to cloud services: no deployment, no Origin checks; it naturally fits the planned exe packaging path
-- Privacy note: redaction covers only names / phone numbers / email addresses; work history and all other content still enter the session context
+- Privacy note: redaction covers names / phone numbers / email addresses / ID-card numbers / bank-card numbers, and reduces — it does not fully anonymize — the exposure surface. A name is masked only in the form the extractor recognized, so pinyin, English names or nicknames may survive; work history and all other content still enter the session context
 - **Companion Skill**: `dist/resume-tool-agent.zip` — install it into office staff's WorkBuddy (user-level skill) and a single "help me screen these resumes" triggers the whole flow; source at `~/.workbuddy/skills/resume-tool-agent/SKILL.md`
 
 ## Format support (doc/pdf first, per the confirmed requirements)
@@ -149,7 +149,7 @@ Backup files are **not encrypted** and contain candidate PII and AI keys. Store 
 - Single screening job: only one screening task may be queued or running at a time, preventing duplicate AI billing and concurrent writes to the library
 - Runtime logs: written to `logs/resume-tool.log` in the data directory; 2 MB per file with 5 rotated files; scenes remain reconstructible after packaging as a console-less exe
 - Error IDs: when a 500 occurs, the page shows an 8-character error ID and the stack trace is logged under the same ID
-- Diagnostics bundle: "Download diagnostics bundle" exports a ZIP with environment info, data-size statistics, redacted AI config (only whether a key is configured) and the 3 most recent logs; **it contains no resume text, candidate PII, API keys or database files**
+- Diagnostics bundle: "Download diagnostics bundle" exports a ZIP with environment info, data-size statistics, redacted AI config (only whether a key is configured) and the 3 most recent logs; logs are scrubbed before packaging (query values, phone, email, ID-card and bank-card numbers masked), and the bundle **contains no resume text, candidate PII, API keys or database files**
 
 ## Screening templates
 
@@ -157,7 +157,7 @@ Backup files are **not encrypted** and contain candidate PII and AI keys. Store 
 
 ## Verified (tested locally)
 
-- Key regression: `python -m unittest discover -s tests -v` (37 tests) covering export ID deduplication, CSV conventions, corrupted-config degradation, template path traversal, cross-site write requests, background job exceptions, DB connection release, backup/restore, restore into a fresh directory, data-directory migration, relative paths, import batches, source-file cleanup on permanent deletion, orphan cleanup, diagnostics-bundle redaction, template selection memory, path-trust boundaries, transactional restore (failed restore keeps the current DB), trash retention, orphan-scan grace period, the single-job gate and CLI/Web data-directory parity
+- Key regression: `python -m unittest discover -s tests -v` (53 tests) covering export ID deduplication, CSV conventions, corrupted-config degradation, template path traversal, cross-site write requests, background job exceptions, DB connection release, backup/restore, restore into a fresh directory, data-directory migration, relative paths, import batches, source-file cleanup on permanent deletion, orphan cleanup, diagnostics-bundle redaction (including log scrubbing and ID/bank-card masking), template selection memory, template deletion/restoration, path-trust boundaries, transactional restore (failed restore keeps the current DB), trash retention, orphan-scan grace period, the single-job gate, CLI/Web data-directory parity, delete-failure reporting, search-context preservation after delete, and no reliance on native `confirm()`
 - Tests run against an isolated temporary data directory (`RESUME_TOOL_DATA_DIR` + `RESUME_TOOL_SKIP_MIGRATION=1`) and never read or write the real resume library
 - 7 samples cover every format path (txt / real docx / docx disguised as .doc / HTML disguised as .doc / RTF disguised as .doc / hand-built PDF), all parsed correctly
 - Keyword engine: a senior backend candidate scoring 91.7 passes, a candidate missing required skills scores 0 and fails; gate and scoring logic are correct
@@ -165,7 +165,7 @@ Backup files are **not encrypted** and contain candidate PII and AI keys. Store 
 - Duplicate imports are 100% deduplicated by content hash; CSV export uses utf-8-sig (opens cleanly in Excel)
 - **Full Agent collaboration chain (2026-11-14)**: 8 resumes keyword pre-screened → agent-export (PII masking active) → evaluated inside the Agent session → agent-import writes back 8 records (engine=ai + provider traceability) → Web UI /screen and CSV reports both display correctly
 
-## Web UI (Beta ver1.2.5)
+## Web UI (Beta ver1.0.0)
 
 ```bash
 python app.py        # → http://127.0.0.1:5000
@@ -179,7 +179,7 @@ python app.py        # → http://127.0.0.1:5000
 | Trash `/trash` | Deletion moves to trash; single/batch restore, permanent delete, empty trash; re-importing an identical file automatically restores the original record |
 | Screening center `/screen` | **Searchable multi-select templates** (filter as you type, chip display, ★ favorites pinned, recently used, AI call estimate, keyboard support); **selection is remembered and restored on next launch** (stored as `screen_templates` in `config/app_settings.json`, auto-invalidated when a template is deleted); three engines to choose from; resume scope = all / unscreened only (per selected template) / specified resumes (searchable by filename or ID, filter by status, select all); **screening runs in a background thread**, the page polls a progress bar (`/screen/job/<id>`), and the completion card keeps a result summary; results grouped by template |
 | Charts `/charts` | Status distribution donut, score distribution, pass rate per template, skill-hit heatmap, import trends (server-side computation + hand-drawn CSS/SVG, no external chart library) |
-| Template management `/templates` | Create, visual editing (department / sub-role, add/remove skill rows, weight, aliases, required flag, live weight total), ★ favorites, JSON source mode, bulk import (per-file validation, auto-rename on name collision), single JSON export / export all as ZIP |
+| Template management `/templates` | Create, visual editing (department / sub-role, add/remove skill rows, weight, aliases, required flag, live weight total), ★ favorites, JSON source mode, bulk import (per-file validation, auto-rename on name collision), single JSON export / export all as ZIP, **delete with "Recently deleted" restore (moved to `.trash`, 30-day retention, never overwrites an existing template)** |
 | Resume detail `/resume/<id>` | Parsed text preview → screening history (10 per page, bottom pager + page jump) → original file preview (PDF/text embedded, doc/docx prompts to open locally); open with: system default / WPS / Word / reveal in Explorer / cloud docs (copy path + open drive) |
 | Export | `GET /export-xlsx`: candidate report (14 columns, frozen header + autofilter + summary sheet, supports q/template/ids filters, IDs auto-deduplicated); `/export` produces CSV with the same search/template conventions, with a Chinese notice for empty results |
 | Changelog `/changelog` | Sidebar entry (NEW badge when unread), historical announcements as version cards, expandable/collapsible |

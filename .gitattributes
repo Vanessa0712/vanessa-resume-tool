@@ -1,0 +1,15 @@
+# 统一文本文件换行符为 LF：仓库历史为 LF，Windows 编辑器写入 CRLF 会让
+# 每次 diff 显示整文件重写，掩盖真实改动。二进制文件按类型显式排除。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.doc binary
+*.docx binary
+*.zip binary
+*.xlsx binary
+*.exe binary

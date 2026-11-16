@@ -9,11 +9,14 @@
   <div class="head-actions">
     {% if rows %}
     <form method="post" action="{{ url_for('trash_empty') }}"
-          onsubmit="return confirm('确认清空回收站？将彻底删除 {{ rows|length }} 份简历及其筛选记录；原始文件移入 .trash 暂存区，30 天内可恢复。')">
+          data-confirm-title="清空回收站"
+          data-confirm-sub="此操作不可撤销"
+          data-confirm-body="将彻底删除 {{ rows|length }} 份简历及其筛选记录；原始文件移入 .trash 暂存区，30 天内可恢复。"
+          data-confirm-ok="清空回收站">
       <button class="btn btn-danger" type="submit">清空回收站</button>
     </form>
     {% endif %}
-    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+    <a class="btn btn-secondary" href="{{ url_for('library') }}" data-back>返回简历库</a>
   </div>
 </div>
 
@@ -38,7 +41,10 @@
               <button class="btn btn-xs" type="submit">恢复</button>
             </form>
             <form method="post" action="{{ url_for('trash_purge', rid=r.id) }}" class="inline"
-                  onsubmit="return confirm('彻底删除「{{ r.filename }}」及其筛选记录？原始文件会移入 .trash 暂存区，30 天内可恢复。')">
+                  data-confirm-title="彻底删除"
+                  data-confirm-sub="30 天内可恢复原始文件"
+                  data-confirm-body="彻底删除「{{ r.filename }}」及其筛选记录？原始文件会移入 .trash 暂存区。"
+                  data-confirm-ok="彻底删除">
               <button class="btn btn-xs btn-danger-ghost" type="submit">彻底删除</button>
             </form>
           </td>

@@ -9,7 +9,7 @@
   </div>
   <div class="head-actions">
     <button class="btn btn-primary" type="button" id="preview-open" {{ '' if (file_info.exists and not deleted) else 'disabled' }}>预览原文件</button>
-    <a class="btn btn-secondary" href="{{ url_for('library') }}">返回简历库</a>
+    <a class="btn btn-secondary" href="{{ url_for('library') }}" data-back>返回简历库</a>
   </div>
 </div>
 
@@ -21,6 +21,24 @@
   </form>
 </div>
 {% endif %}
+
+{% for f in review_flags %}
+<div class="banner-info">
+  <div>
+    <div><b>建议复核</b>：模板「{{ f.template }}」下关键词 {{ f.keyword }} 分、AI {{ f.ai }} 分，相差 {{ f.gap }} 分。</div>
+    <div class="hint" style="margin:4px 0 0">
+      关键词：{{ f.kw_reason or '无' }}　·　AI：{{ f.ai_reason or '无' }}
+    </div>
+    <div class="hint" style="margin:2px 0 0">
+      {% if f.higher == 'ai' %}
+      关键词分偏低，常见原因是同义表述（如「容器化」没写 Docker）、英文简历或技能只在项目里描述——AI 读语义，关键词只认别名，建议以原文为准。
+      {% else %}
+      关键词命中更高，AI 判定偏严，可能是 AI 对简历里的年限或技能深度理解偏差，建议人工确认。
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endfor %}
 
 <div class="card">
   <div class="card-title">原文件</div>
@@ -65,7 +83,15 @@
     <div class="card-title">筛选历史
       <span class="muted">（共 {{ pager_info.total }} 次{% if pager_info.pages > 1 %} · 第 {{ pager_info.page }}/{{ pager_info.pages }} 页{% endif %}）</span>
     </div>
-    {% if pager_info.pages > 1 %}<span class="muted small">每页 {{ pager_info.per_page }} 条</span>{% endif %}
+    {% if history %}
+    <form method="post" action="{{ url_for('resume_history_clear', rid=r.id) }}"
+          data-confirm-title="清除筛选历史"
+          data-confirm-sub="先存档快照，简历本体与原始文件不受影响"
+          data-confirm-body="将清除该简历的 {{ pager_info.total }} 条筛选历史（含关键词与 AI 结果）。清除前会自动在数据目录 .trash 生成 JSON 快照并保留 {{ trash_days }} 天，页面与导出报告不再包含这些记录；如需长期留档请先导出报告。"
+          data-confirm-ok="清除历史">
+      <button class="btn btn-sm btn-danger-ghost" type="submit">清除历史</button>
+    </form>
+    {% endif %}
   </div>
 
   {% if history %}
@@ -78,7 +104,7 @@
         <td>{{ '关键词' if h.engine == 'keyword' else 'AI' }}</td>
         <td>{{ h.template }}</td>
         <td>{{ badge(h.status) }}</td>
-        <td class="score">{{ h.score }}</td>
+        <td class="score">{{ h.score }}{% if h.engine == 'keyword' and h.detail.get('ruleset', 1) != score_ruleset %}<span class="ruleset-tag" title="该记录按旧评分口径计算（提及一次只计 40%），与当前分数不可直接比较，重新筛选即可更新">旧口径</span>{% endif %}</td>
         <td class="reason">{{ h.detail.get('reason', '') }}</td>
       </tr>
       {% endfor %}

@@ -1,5 +1,64 @@
 // 简历筛选工具 Web UI 交互（无外部依赖，离线可用）
 
+// ---- 滚动位置保持 ----
+// 保存/删除/恢复备份等操作走的是「POST → 302 → GET」模式，浏览器把重定向当成
+// 一次全新导航，页面会跳回顶部；从详情页点「返回简历库」同理。这里按 URL 记住
+// 离开时的滚动位置，回到同一 URL 时还原一次。
+(function () {
+  const KEY = 'rt:scroll:';
+  const key = () => KEY + location.pathname + location.search;
+
+  function save() {
+    try {
+      sessionStorage.setItem(key(), String(window.scrollY || 0));
+    } catch (e) { /* 隐私模式禁用存储时忽略 */ }
+  }
+
+  function restore() {
+    if (location.hash) return;  // 带锚点（如 #history）时交给浏览器定位
+    let raw = null;
+    try {
+      raw = sessionStorage.getItem(key());
+      if (raw === null) return;
+      sessionStorage.removeItem(key());  // 只还原一次，下次主动进入该页仍从头开始
+    } catch (e) {
+      return;
+    }
+    const y = parseInt(raw, 10);
+    if (!(y > 0)) return;
+    window.scrollTo(0, y);
+    // 闪存提示条/字体加载会把内容下推，稍后再校一次
+    setTimeout(() => window.scrollTo(0, y), 90);
+  }
+
+  document.addEventListener('submit', save, true);   // 表单提交（保存、删除、筛选）
+  window.addEventListener('pagehide', save);          // 点链接离开
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', restore);
+  } else {
+    restore();
+  }
+})();
+
+// ---- 「返回」按钮：来源页正好是目标页时走浏览器后退 ----
+// 直接链到 / 会丢掉来源页的模板筛选与页码；后退能原样回去，滚动位置也由浏览器保留。
+// 只有来源页路径与按钮指向一致时才接管，避免「返回简历库」把人送到候选人页。
+document.addEventListener('click', e => {
+  const link = e.target.closest('a[data-back]');
+  if (!link || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+  const ref = document.referrer;
+  if (!ref) return;
+  try {
+    const from = new URL(ref);
+    if (from.origin !== location.origin) return;
+    if (from.pathname !== new URL(link.href, location.origin).pathname) return;
+  } catch (err) {
+    return;
+  }
+  e.preventDefault();
+  history.back();
+});
+
 // ---- 通用：弹窗开关 ----
 function openModal(id) {
   const el = document.getElementById(id);
@@ -20,6 +79,66 @@ document.addEventListener('keydown', e => {
     document.querySelectorAll('.modal-mask:not([hidden])').forEach(m => { m.hidden = true; });
   }
 });
+
+// ---- 通用确认弹窗（替代浏览器原生 confirm）----
+// 原生 confirm() 一旦被浏览器拦截（用户勾过「阻止此页面创建更多对话框」），
+// 会直接返回 false 且不显示对话框，删除等写操作就静默失效、毫无反馈。
+(function () {
+  const modal = document.getElementById('confirm-modal');
+  if (!modal) return;
+  const titleEl = document.getElementById('confirm-title');
+  const subEl = document.getElementById('confirm-sub');
+  const bodyEl = document.getElementById('confirm-body');
+  const okBtn = document.getElementById('confirm-ok');
+  let pending = null;
+
+  function ask(el, onOk) {
+    titleEl.textContent = el.dataset.confirmTitle || '请确认';
+    subEl.textContent = el.dataset.confirmSub || '';
+    subEl.hidden = !el.dataset.confirmSub;
+    bodyEl.textContent = el.dataset.confirmBody || '';
+    okBtn.textContent = el.dataset.confirmOk || '确认';
+    pending = onOk;
+    openModal('confirm-modal');
+    okBtn.focus();
+  }
+
+  okBtn.addEventListener('click', () => {
+    const fn = pending;
+    pending = null;
+    closeModal('confirm-modal');
+    if (fn) fn();
+  });
+  modal.querySelectorAll('[data-close]').forEach(b => {
+    b.addEventListener('click', () => { pending = null; });
+  });
+
+  // 1) 按钮式操作（单条删除等）：按 formaction 提交
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-confirm-delete]');
+    if (!btn) return;
+    e.preventDefault();
+    ask(btn, () => {
+      const url = btn.formAction || (btn.form && btn.form.action);
+      let form = btn.form;
+      if (!form) {
+        form = document.createElement('form');
+        form.method = 'post';
+        document.body.appendChild(form);
+      }
+      form.action = url;
+      form.submit();
+    });
+  });
+
+  // 2) 表单式操作（彻底删除、清空回收站、恢复备份等）
+  document.addEventListener('submit', e => {
+    const form = e.target;
+    if (!form.matches || !form.matches('form[data-confirm-body]')) return;
+    e.preventDefault();
+    ask(form, () => form.submit());
+  });
+})();
 
 // ---- 文件拖拽区（简历上传 / 模板导入共用） ----
 document.querySelectorAll('.dropzone').forEach(zone => {

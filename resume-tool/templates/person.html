@@ -13,7 +13,7 @@
   </div>
   <div class="head-actions">
     <a class="btn btn-secondary" href="{{ url_for('export_xlsx', ids=versions|map(attribute='id')|join(',')) }}">导出该候选人 xlsx</a>
-    <a class="btn btn-secondary" href="{{ url_for('persons') }}">返回候选人</a>
+    <a class="btn btn-secondary" href="{{ url_for('persons') }}" data-back>返回候选人</a>
   </div>
 </div>
 
@@ -49,7 +49,11 @@
             <a class="btn btn-xs" href="{{ url_for('resume_detail', rid=v.id) }}">详情</a>
             {% if not v.deleted_at %}
             <button class="btn btn-xs btn-danger-ghost" type="submit" form="del-{{ v.id }}"
-                    onclick="return confirm('将「{{ v.filename }}」移入回收站？')">删除</button>
+                    data-confirm-delete
+                    data-confirm-title="移入回收站"
+                    data-confirm-sub="可随时在回收站恢复"
+                    data-confirm-body="将「{{ v.filename }}」移入回收站？磁盘上的原始文件会保留。"
+                    data-confirm-ok="移入回收站">删除</button>
             <form method="post" id="del-{{ v.id }}" action="{{ url_for('resume_delete', rid=v.id) }}"></form>
             {% endif %}
           </td>
