@@ -202,8 +202,26 @@ python app.py        # → http://127.0.0.1:5000
 - 回收站只做逻辑删除：筛选记录保留，磁盘原文件始终保留；彻底删除后不可恢复
 - 后台任务状态存于进程内存，重启服务后历史任务进度不可查（数据本身已落库）
 
+## 打包成 exe（PyInstaller onedir）
+
+产物在 `dist/ResumeTool/`：`ResumeTool.exe` + `_internal/`，合计约 59 MB。复现命令：
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm --clean ResumeTool.spec
+```
+
+打包后的运行行为：
+
+- 双击 `ResumeTool.exe` 无控制台窗口，约 1 秒后自动拉起默认浏览器；设 `RESUME_TOOL_NO_BROWSER=1` 可禁用自动打开
+- 数据目录固定在 `%LOCALAPPDATA%\ResumeTool`，与程序目录分离，换版本不覆盖简历数据；设 `RESUME_TOOL_DATA_DIR` 可覆盖
+- 端口优先 5000，被占用时自动顺延（`TRUSTED_HOSTS` 白名单随之更新，不会出现 400）
+- `_internal/` 下的 `templates`、`static`、`config/templates` 是随包资源，移动或清理会导致页面报错
+- 首次启动会从程序目录旁复制旧数据（若有），旧文件保留不删除
+- 退出：当前需在任务管理器结束 `ResumeTool.exe`，尚未提供托盘图标或界面退出入口
+
 ## 下一步路线（对应可行性报告里程碑）
 
-1. exe 打包：PyInstaller onedir + waitress + 数据目录外移 + 必改 5 项（见《exe-feasibility-report.md》）
+1. exe 分发：onedir 打包已完成（见上节），待补 Inno Setup 安装包、托盘图标与代码签名
 2. 简历标签 / 同人多版本聚合、搜索历史与高亮
 3. 批量导出候选人报告（xlsx，含评分明细与判定理由）

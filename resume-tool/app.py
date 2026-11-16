@@ -17,11 +17,13 @@ import copy
 import io
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import webbrowser
 import zipfile
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
@@ -161,7 +164,11 @@ def _load_or_create_secret_key(path: Path) -> str:
     return value
 
 
-app = Flask(__name__)
+app = Flask(__name__,
+            template_folder=str(RESOURCE_BASE / "templates"),
+            static_folder=str(RESOURCE_BASE / "static"))
+# 打包成 exe 后 __name__ 为 __main__，Flask 推断的 root_path 不可靠；
+# 显式指向 RESOURCE_BASE（源码运行=项目目录，PyInstaller 运行=_MEIPASS）。
 _configured_secret = os.environ.get("RESUME_TOOL_SECRET_KEY", "").strip()
 if _configured_secret and len(_configured_secret) < 32:
     raise RuntimeError("RESUME_TOOL_SECRET_KEY 至少需要 32 个字符")
@@ -169,6 +176,7 @@ app.secret_key = (_configured_secret or
                   _load_or_create_secret_key(CONFIG_DIR / ".flask_secret_key"))
 app.config["TEMPLATES_AUTO_RELOAD"] = True  # UI 迭代期模板改动即时生效，无需重启
 # 只接受回环地址的 Host，阻断 DNS rebinding；本应用仅面向 127.0.0.1 单机使用。
+# 实际监听端口在 main() 里可能顺延，届时会重写这份白名单。
 app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "127.0.0.1:5000", "localhost:5000"]
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 上传/恢复上限，兼顾批量简历与数据库备份
 
@@ -3200,7 +3208,24 @@ def _assert_flask_version() -> None:
             f"Flask {raw} 版本过低：Host 白名单与同源校验需要 3.1 以上，请升级后再启动")
 
 
+def pick_listen_port(host: str = "127.0.0.1", preferred: int = 5000,
+                     span: int = 20) -> int:
+    """挑一个可绑定的回环端口：优先 preferred，被占用则顺延，兜底交给系统分配."""
+    for port in range(preferred, preferred + span):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host, port))
+            except OSError:
+                continue
+        return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
 def main() -> None:
+    # 打包后必须最先调用：否则任何子进程都会重新拉起整个应用（任务管理器残留多份）
+    multiprocessing.freeze_support()
     configure_logging()
     _assert_flask_version()
     app.logger.info("启动简历工具 %s；数据目录 %s", current_version(), DATA_DIR)
@@ -3241,14 +3266,22 @@ def main() -> None:
         app.logger.warning(
             "历史裁剪未执行，超限记录已保留（不影响启动）：%s", exc)
     # 单机桌面用途：只绑定回环地址，关闭 reloader（打包 exe 的硬性要求）
+    port = pick_listen_port()
+    # 端口可能顺延：Host 白名单必须与实际端口一致，否则 Flask 3.1 直接返回 400
+    app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost",
+                                   f"127.0.0.1:{port}", f"localhost:{port}"]
+    url = f"http://127.0.0.1:{port}"
+    # 无控制台模式下双击不会看到任何窗口，启动后自动拉起默认浏览器
+    if getattr(sys, "frozen", False) and not os.environ.get("RESUME_TOOL_NO_BROWSER"):
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     try:
         from waitress import serve
     except ImportError:
         app.logger.warning("未安装 waitress，回退到 Flask 开发服务器（不建议分发给办公人员）")
-        app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
+        app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
     else:
-        app.logger.info("以 waitress 启动：http://127.0.0.1:5000")
-        serve(app, host="127.0.0.1", port=5000, threads=8)
+        app.logger.info("以 waitress 启动：%s", url)
+        serve(app, host="127.0.0.1", port=port, threads=8)
 
 
 if __name__ == "__main__":
