@@ -218,10 +218,58 @@ pyinstaller --noconfirm --clean ResumeTool.spec
 - 端口优先 5000，被占用时自动顺延（`TRUSTED_HOSTS` 白名单随之更新，不会出现 400）
 - `_internal/` 下的 `templates`、`static`、`config/templates` 是随包资源，移动或清理会导致页面报错
 - 首次启动会从程序目录旁复制旧数据（若有），旧文件保留不删除
-- 退出：当前需在任务管理器结束 `ResumeTool.exe`，尚未提供托盘图标或界面退出入口
+- 退出：设置页最下方有「退出程序」按钮；关闭浏览器标签页不会结束后台进程
+
+## 制作安装包（Inno Setup）
+
+前置：先完成上一节的 PyInstaller 打包。
+
+```powershell
+# Inno Setup 7，官网 https://jrsoftware.org/isdl.php
+& "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe" installer\ResumeTool.iss
+```
+
+产物：`dist/installer/ResumeTool-Setup-<版本>.exe`，约 26 MB（LZMA2 压缩）。
+
+安装程序行为：
+
+- 默认装到 `%LOCALAPPDATA%\Programs\ResumeTool`，不需要管理员权限；要装到 Program Files 时，安装界面的权限页可选「为所有用户安装」
+- 界面品牌元素：左侧竖图 `assets/wizard-large.bmp`（164×314）、右上角小图 `assets/wizard-small.bmp`（55×55）、程序与安装包图标 `assets/ResumeTool.ico`
+- 安装前有「安装前须知」页（`installer/install-notes.txt`），说明数据目录位置、如何退出程序、迁移旧数据与 SmartScreen 提示
+- 升级安装沿用同一 `AppId`，只覆盖程序文件，不动数据目录
+- 卸载后弹窗提示数据仍在 `%LOCALAPPDATA%\ResumeTool`，不会静默删除简历
+
+图标由 `static/brand.svg` 的几何参数重绘生成（`make_icon.py`），16/24/32 px 使用单独的简化版，避免小尺寸下描边与镜片糊成一团。改 logo 后需重新生成 `assets/` 下的 ico 与向导图。
+
+## 代码签名
+
+签名顺序必须与打包顺序一致，否则安装包里嵌的仍是未签名 exe：
+
+1. PyInstaller 生成 `dist\ResumeTool\ResumeTool.exe`
+2. 签名 exe
+3. 编译安装包（把已签名的 exe 嵌进去）
+4. 签名安装包
+
+```powershell
+# 一条命令完成上述四步：签 exe → 重编安装包 → 签安装包 → 导出公钥证书
+.\installer\sign.ps1 -SelfSigned -RebuildInstaller
+
+# 拿到正式 pfx 证书后
+.\installer\sign.ps1 -PfxPath D:\cert\mycert.pfx -PfxPassword '******' -RebuildInstaller
+
+# 证书已导入 CurrentUser\My
+.\installer\sign.ps1 -Thumbprint <证书指纹> -RebuildInstaller
+```
+
+自签名证书的边界：
+
+- 脚本生成 `CN=Resume Tool` 的开发证书（3 年有效，存于当前用户证书库），并导出公钥 `.cer` 到 `dist\installer\`
+- 签名后文件属性页能看到签名者与 DigiCert 时间戳，但证书链不受信任，目标机仍提示「未知发布者」
+- 让目标机信任：把 `.cer` 导入「受信任的根证书颁发机构」（需管理员确认），或由域策略统一推送
+- **自签名无法消除 SmartScreen 警告**，对外分发必须使用商业代码签名证书
 
 ## 下一步路线（对应可行性报告里程碑）
 
-1. exe 分发：onedir 打包已完成（见上节），待补 Inno Setup 安装包、托盘图标与代码签名
+1. exe 分发：onedir 打包、安装包、程序图标与签名脚本已完成，待补托盘图标与正式代码签名证书
 2. 简历标签 / 同人多版本聚合、搜索历史与高亮
 3. 批量导出候选人报告（xlsx，含评分明细与判定理由）
