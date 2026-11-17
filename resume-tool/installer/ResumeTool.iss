@@ -3,7 +3,7 @@
 ; 前置：先跑 PyInstaller 生成 ..\dist\ResumeTool\
 
 #define AppName "Resume Tool"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppExe "ResumeTool.exe"
 #define AppPublisher "Resume Tool"
 #define AppRepo "https://github.com/Vanessa0712/vanessa-resume-tool"
@@ -39,7 +39,7 @@ WizardSmallImageFile=..\assets\wizard-small.bmp
 WizardImageStretch=no
 InfoBeforeFile=install-notes.txt
 ; 安装程序自身也带版本资源，属性页可查
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.0.1.0
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription={#AppName} 安装程序
 VersionInfoProductName={#AppName}
