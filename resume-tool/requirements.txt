@@ -3,6 +3,7 @@ flask>=3.1,<4       # Web UI 服务；Host 白名单需要 3.1+，禁止降到 3
 waitress>=3.0       # 生产级 WSGI 服务器（缺失时回退开发服务器，不用于分发）
 pypdf>=4.0          # PDF 文本抽取（缺失时 PDF 简历会跳过并提示）
 openpyxl>=3.1       # 导出 xlsx 候选人报告（缺失时页面提示安装）
+pywebview>=6.2; sys_platform == "win32"   # 独立桌面窗口外壳（缺失时自动回退浏览器）
 
 # 开发/自检用（非运行时必需）
 # websocket-client  # tools/screenshot.py 通过 Chrome DevTools Protocol 截图

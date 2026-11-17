@@ -51,11 +51,20 @@
 <body>
   <div class="box">
     <h1>程序已退出</h1>
+    {% if desktop_mode %}
+    <p>窗口即将自动关闭，无需手动操作。</p>
+    {% else %}
     <p>后台服务已停止，现在可以直接关闭这个标签页。</p>
+    {% endif %}
     <p>简历数据、模板与筛选结果都已保存在本机，下次启动会原样恢复。</p>
     <div class="tip">
+      {% if desktop_mode %}
+      需要重新使用，双击 <code>ResumeTool.exe</code> 再启动一次即可。
+      若窗口没有自动关闭，可以直接点右上角关闭按钮，不会影响已保存的数据。
+      {% else %}
       需要重新使用，双击 <code>ResumeTool.exe</code> 再启动一次即可。
       若几秒后页面仍能正常打开，说明程序还在运行，可以到任务管理器结束 <code>ResumeTool.exe</code>。
+      {% endif %}
     </div>
   </div>
 </body>

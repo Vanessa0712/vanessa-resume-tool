@@ -181,10 +181,10 @@
 
 <div class="card" id="shutdown">
   <div class="card-title">退出程序</div>
-  <p class="hint">关闭标签页或浏览器窗口只是关掉页面，后台程序仍在运行。要彻底结束程序，用下面的按钮；退出不会删除任何数据，下次双击程序即可继续。</p>
+  <p class="hint">{% if desktop_mode %}直接点窗口右上角关闭按钮即可退出，后台服务会一起结束。也可以用下面的按钮。退出不会删除任何数据，下次双击程序即可继续。{% else %}关闭标签页或浏览器窗口只是关掉页面，后台程序仍在运行。要彻底结束程序，用下面的按钮；退出不会删除任何数据，下次双击程序即可继续。{% endif %}</p>
   <form method="post" action="{{ url_for('settings_shutdown') }}"
         data-confirm-title="退出程序"
-        data-confirm-sub="后台服务会立即停止"
+        data-confirm-sub="{% if desktop_mode %}窗口将关闭{% else %}后台服务会立即停止{% endif %}"
         data-confirm-body="退出后当前页面将无法继续操作，需要重新启动程序。已导入的简历、模板与筛选结果不受影响。"
         data-confirm-ok="退出">
     <button class="btn btn-danger" type="submit">退出程序</button>

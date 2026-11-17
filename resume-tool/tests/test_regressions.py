@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -2178,5 +2179,101 @@ class UploadFormSameOriginTests(unittest.TestCase):
             "/import-files", data=data, content_type="multipart/form-data",
             headers={"Origin": "null", "Sec-Fetch-Site": "cross-site"})
         self.assertEqual(response.status_code, 403)
+
+
+class DesktopModeTests(unittest.TestCase):
+    """桌面窗口模式：启动方式判定、任务状态判定、退出路径切换."""
+
+    def setUp(self):
+        self._env = os.environ.pop("RESUME_TOOL_NO_BROWSER", None)
+        self._argv = list(sys.argv)
+        self._hook = appmod.SHUTDOWN_HOOK
+        self._jobs = dict(appmod.JOBS)
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("RESUME_TOOL_NO_BROWSER", None)
+        else:
+            os.environ["RESUME_TOOL_NO_BROWSER"] = self._env
+        sys.argv = self._argv
+        appmod.SHUTDOWN_HOOK = self._hook
+        with appmod.JOBS_LOCK:
+            appmod.JOBS.clear()
+            appmod.JOBS.update(self._jobs)
+
+    def test_browser_flag_forces_browser_mode(self):
+        sys.argv = ["app.py"]
+        self.assertTrue(appmod._desktop_requested())
+        sys.argv = ["app.py", "--browser"]
+        self.assertFalse(appmod._desktop_requested())
+
+    def test_env_var_suppresses_window_for_automation(self):
+        # 冒烟测试用这个变量抑制弹窗，桌面模式下同样必须生效
+        os.environ["RESUME_TOOL_NO_BROWSER"] = "1"
+        sys.argv = ["app.py"]
+        self.assertFalse(appmod._desktop_requested())
+
+    def test_has_active_jobs_tracks_queued_and_running(self):
+        with appmod.JOBS_LOCK:
+            appmod.JOBS.clear()
+        self.assertFalse(appmod.has_active_jobs())
+        for state in ("queued", "running"):
+            appmod.JOBS["job"] = {"state": state}
+            self.assertTrue(appmod.has_active_jobs(), state)
+        for state in ("done", "failed"):
+            appmod.JOBS["job"] = {"state": state}
+            self.assertFalse(appmod.has_active_jobs(), state)
+
+    def test_shutdown_prefers_window_close_over_killing_process(self):
+        calls = []
+        appmod.SHUTDOWN_HOOK = lambda: calls.append("window")
+        with patch.object(appmod, "_exit_process") as exit_mock:
+            appmod._do_shutdown()
+        self.assertEqual(calls, ["window"])
+        exit_mock.assert_not_called()
+
+    def test_shutdown_falls_back_when_window_hook_fails(self):
+        def boom():
+            raise RuntimeError("窗口已销毁")
+
+        appmod.SHUTDOWN_HOOK = boom
+        with patch.object(appmod, "_exit_process") as exit_mock:
+            appmod._do_shutdown()
+        exit_mock.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == "win32", "单实例与 WebView2 检测仅 Windows")
+    def test_single_instance_lock_rejects_second_holder(self):
+        import desktop_shell as ds
+
+        name = "Local\\ResumeTool.Test.SingleInstance"
+        self.assertTrue(ds.acquire_single_instance(name))
+        self.assertFalse(ds.acquire_single_instance(name))
+
+    @unittest.skipUnless(sys.platform == "win32", "WebView2 检测仅 Windows")
+    def test_webview2_probe_never_raises(self):
+        import desktop_shell as ds
+
+        self.assertIsInstance(ds.webview2_runtime_installed(), bool)
+
+    @unittest.skipUnless(sys.platform == "win32", "窗口激活仅 Windows")
+    def test_activating_missing_window_returns_false(self):
+        import desktop_shell as ds
+
+        self.assertFalse(ds.activate_existing_window("不存在的窗口标题-XYZ", timeout_s=0.3))
+
+    def test_close_is_allowed_when_no_job_running(self):
+        # 空闲时关窗必须直接放行，且不应弹任何确认框
+        import desktop_shell as ds
+
+        def confirm_must_not_run():
+            raise AssertionError("空闲时不应弹确认框")
+
+        self.assertTrue(ds.should_allow_close(lambda: False, confirm_must_not_run))
+
+    def test_close_is_blocked_while_busy_unless_user_confirms(self):
+        import desktop_shell as ds
+
+        self.assertFalse(ds.should_allow_close(lambda: True, lambda: False))
+        self.assertTrue(ds.should_allow_close(lambda: True, lambda: True))
 
 
