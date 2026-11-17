@@ -165,11 +165,17 @@ python resume_tool.py agent-import --in agent-results.json --template config/tem
 - 重复导入按内容哈希 100% 去重；CSV 导出使用 utf-8-sig（Excel 打开不乱码）
 - **完整 Agent 协作链路（2026-11-14）**：8 份简历关键词预筛 → agent-export（PII 脱敏生效）→ Agent 会话内评估 → agent-import 写回 8 条记录（engine=ai + provider 可追溯）→ Web 界面 /screen 与 CSV 报告均正确展示
 
-## Web 界面（Beta ver1.0.0）
+## 桌面应用（Beta ver1.1.0）
 
 ```bash
-python app.py        # → http://127.0.0.1:5000
+python app.py            # 打开独立应用窗口（默认）
+python app.py --browser  # 改用浏览器打开（排障或开发调试时用）
 ```
+
+- 窗口关闭即退出程序，后台服务随窗口一起结束
+- 筛选任务运行中关窗会先弹确认框，避免误中断任务
+- 同一时间只运行一个实例：重复双击会直接切换到已打开的窗口
+- 系统缺少 WebView2 运行时时自动回退到浏览器打开，功能不受影响
 
 | 页面 | 能力 |
 |------|------|

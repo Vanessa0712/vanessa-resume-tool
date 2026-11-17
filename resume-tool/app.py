@@ -293,6 +293,21 @@ def set_security_headers(response):
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
     {
+        "version": "ver1.1.0",
+        "channel": "Beta",
+        "date": "2026-11-17",
+        "title": "Beta 1.1.0：改为独立桌面窗口",
+        "entries": [
+            "界面从浏览器标签页改为独立应用窗口：有独立任务栏图标与标题栏，不再占地浏览器标签、也不会误关到别处",
+            "关闭窗口即退出程序，不再需要在设置页手动退出；后台服务随窗口一起结束",
+            "筛选任务运行中关窗会先弹确认框，避免误点关闭把跑到一半的任务掐断",
+            "同一时间只允许运行一个实例：重复双击会直接切换到已打开的窗口，避免两个进程同时写同一份简历库",
+            "系统缺少 WebView2 运行时时自动回退到浏览器打开，功能不受影响；也可用 --browser 参数主动使用浏览器模式",
+            "导出 CSV / xlsx 报告改用系统「另存为」对话框选择保存位置，导出明细、批量报告与模板导出均可用",
+            "设置页「退出程序」在桌面模式下改为关闭窗口，与点窗口关闭按钮走同一条路径",
+        ],
+    },
+    {
         "version": "ver1.0.2",
         "channel": "Beta",
         "date": "2026-11-17",
@@ -3048,6 +3063,7 @@ def settings():
                            orphan_count=len(orphans),
                            orphan_size=human_size(orphan_bytes),
                            log_file=str(LOG_FILE),
+                           desktop_mode=SHUTDOWN_HOOK is not None,
                            active="settings")
 
 
@@ -3301,6 +3317,12 @@ def settings_preview():
     return redirect(url_for("settings"))
 
 
+def has_active_jobs() -> bool:
+    """是否有排队中/运行中的筛选任务；关窗与退出入口都以此为准."""
+    with JOBS_LOCK:
+        return any(j.get("state") in ("queued", "running") for j in JOBS.values())
+
+
 def _exit_process() -> None:
     """真正终止进程；单独抽成函数，便于测试替身（否则测试会杀掉自己）."""
     try:
@@ -3309,13 +3331,29 @@ def _exit_process() -> None:
         os._exit(0)
 
 
-def schedule_shutdown(delay_s: float = 0.8) -> None:
-    """先让「已退出」页面回到浏览器，再结束进程.
+# 桌面模式下由窗口壳注册：退出改为「关闭窗口」，让关窗逻辑只有一条路径
+SHUTDOWN_HOOK = None
 
-    延迟是必要的：立即退出会让浏览器拿不到响应，用户看到的是连接被重置，
+
+def _do_shutdown() -> None:
+    """实际执行退出：桌面模式关窗口，浏览器模式直接结束进程."""
+    hook = SHUTDOWN_HOOK
+    if hook is not None:
+        try:
+            hook()
+            return
+        except Exception:
+            app.logger.exception("桌面退出回调失败，改为直接结束进程")
+    _exit_process()
+
+
+def schedule_shutdown(delay_s: float = 0.8) -> None:
+    """先让「已退出」页面回到界面，再执行退出.
+
+    延迟是必要的：立即退出会让页面拿不到响应，用户看到的是连接被重置，
     分不清是「已退出」还是「程序崩了」。
     """
-    timer = threading.Timer(delay_s, _exit_process)
+    timer = threading.Timer(delay_s, _do_shutdown)
     timer.daemon = True
     timer.start()
 
@@ -3323,14 +3361,12 @@ def schedule_shutdown(delay_s: float = 0.8) -> None:
 @app.post("/settings/shutdown")
 def settings_shutdown():
     """退出程序：打包后既无控制台也无窗口，用户需要一个显式的退出入口."""
-    with JOBS_LOCK:
-        active = any(j.get("state") in ("queued", "running") for j in JOBS.values())
-    if active:
+    if has_active_jobs():
         flash("仍有筛选任务在运行，请等待完成后再退出", "error")
         return redirect(url_for("settings", _anchor="shutdown"))
-    app.logger.info("收到退出请求，即将结束进程")
+    app.logger.info("收到退出请求，即将退出")
     schedule_shutdown()
-    return render_template("shutdown.html")
+    return render_template("shutdown.html", desktop_mode=SHUTDOWN_HOOK is not None)
 
 
 def _assert_flask_version() -> None:
@@ -3409,16 +3445,99 @@ def main() -> None:
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost",
                                    f"127.0.0.1:{port}", f"localhost:{port}"]
     url = f"http://127.0.0.1:{port}"
-    # 无控制台模式下双击不会看到任何窗口，启动后自动拉起默认浏览器
-    if getattr(sys, "frozen", False) and not os.environ.get("RESUME_TOOL_NO_BROWSER"):
+
+    want_window = _desktop_requested()
+    if want_window:
+        status = _desktop_preflight()
+        if status == "already-running":
+            return  # 已激活原窗口，本进程不再启动服务
+        if status != "ok":
+            want_window = False  # 缺组件：按浏览器模式继续，功能不受影响
+
+    # 服务统一放后台线程：窗口模式下主线程要留给窗口事件循环
+    server = threading.Thread(target=_serve_forever, args=(port,),
+                              name="http-server", daemon=True)
+    server.start()
+    if not _wait_http_ready(url):
+        app.logger.error("HTTP 服务在 20 秒内未就绪")
+
+    if want_window and _DESKTOP_SHELL is not None:
+        if _DESKTOP_SHELL.open_window(url, has_active_jobs, _register_shutdown_hook):
+            app.logger.info("窗口已关闭，进程退出")
+            return
+        # 窗口起不来（WebView2 初始化失败等）：退回浏览器，保证功能可用
+        app.logger.warning("桌面窗口不可用，回退到浏览器打开")
+        webbrowser.open(url)
+    elif getattr(sys, "frozen", False) and not os.environ.get("RESUME_TOOL_NO_BROWSER"):
+        # 浏览器模式：无控制台时双击看不到任何提示，启动后拉起默认浏览器
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+
+    server.join()
+
+
+def _desktop_requested() -> bool:
+    """是否尝试桌面窗口；--browser 或 RESUME_TOOL_NO_BROWSER 强制回浏览器."""
+    if os.environ.get("RESUME_TOOL_NO_BROWSER"):
+        return False
+    return "--browser" not in sys.argv[1:]
+
+
+_DESKTOP_SHELL = None
+
+
+def _desktop_preflight() -> str:
+    """窗口模式前置检查，返回 ok / already-running / unavailable.
+
+    任何一项不满足都退回浏览器——宁可界面朴素，也不能双击打不开。
+    """
+    global _DESKTOP_SHELL
+    if sys.platform != "win32":
+        return "unavailable"
+    try:
+        import desktop_shell
+    except Exception:
+        app.logger.warning("未安装 pywebview，改用浏览器模式", exc_info=True)
+        return "unavailable"
+    if not desktop_shell.webview2_runtime_installed():
+        app.logger.warning("未检测到 WebView2 运行时，改用浏览器模式")
+        return "unavailable"
+    if not desktop_shell.acquire_single_instance():
+        if desktop_shell.activate_existing_window():
+            app.logger.info("已有实例在运行，已切换到该窗口")
+        else:
+            app.logger.warning("已有实例在运行，但未找到它的窗口")
+        return "already-running"
+    _DESKTOP_SHELL = desktop_shell
+    return "ok"
+
+
+def _register_shutdown_hook(destroy) -> None:
+    """桌面模式：退出入口从「杀进程」改为「关闭窗口」，让退出只有一条路径."""
+    global SHUTDOWN_HOOK
+    SHUTDOWN_HOOK = destroy
+    app.logger.info("桌面模式：设置页退出入口已改为关闭窗口")
+
+
+def _wait_http_ready(url: str, timeout_s: float = 20.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url + "/", timeout=1) as resp:
+                if resp.status < 500:
+                    return True
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.15)
+    return False
+
+
+def _serve_forever(port: int) -> None:
     try:
         from waitress import serve
     except ImportError:
         app.logger.warning("未安装 waitress，回退到 Flask 开发服务器（不建议分发给办公人员）")
         app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
     else:
-        app.logger.info("以 waitress 启动：%s", url)
+        app.logger.info("以 waitress 启动：http://127.0.0.1:%s", port)
         serve(app, host="127.0.0.1", port=port, threads=8)
 
 
