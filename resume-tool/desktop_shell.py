@@ -32,8 +32,12 @@ WEBVIEW2_REG_KEYS_HKCU = (
     r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
 )
 
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
+# kernel32/user32 只有 Windows 才有。这里必须条件绑定而不是直接调用：
+# 模块里的关窗决策函数是纯逻辑，任何平台都该能导入（Linux CI 就是靠它在跑测试）。
+# 直接在模块级调 ctypes.WinDLL，非 Windows 上连 import 都会 AttributeError。
+IS_WINDOWS = os.name == "nt"
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if IS_WINDOWS else None
+_user32 = ctypes.WinDLL("user32", use_last_error=True) if IS_WINDOWS else None
 
 # 互斥量句柄必须活到进程结束，否则关闭即释放，锁形同虚设
 _mutex_handle = None
@@ -53,6 +57,8 @@ def _read_registry_version(root, path: str) -> str:
 
 def webview2_runtime_installed() -> bool:
     """WebView2 运行时是否可用（任一注册位置命中即认为可用）."""
+    if not IS_WINDOWS:
+        return False
     import winreg
 
     for path in WEBVIEW2_REG_KEYS:
@@ -70,6 +76,9 @@ def acquire_single_instance(name: str = MUTEX_NAME) -> bool:
     拿不到锁说明同一会话里已经有实例在跑，调用方应激活原窗口而不是继续启动。
     """
     global _mutex_handle
+    if _kernel32 is None:
+        # 非 Windows 没有互斥量，直接放行（不影响 Windows 上的单实例语义）
+        return True
     handle = _kernel32.CreateMutexW(None, False, name)
     if not handle:
         # 无法创建互斥量（权限等异常）时不阻断启动，宁可允许多开也不能打不开
@@ -89,6 +98,8 @@ def activate_existing_window(title: str = WINDOW_TITLE, timeout_s: float = 3.0) 
     """
     deadline = time.time() + timeout_s
     sw_restore = 9
+    if _user32 is None:
+        return False
     while time.time() < deadline:
         hwnd = _user32.FindWindowW(None, title)
         if hwnd:

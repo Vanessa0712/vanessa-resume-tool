@@ -2276,4 +2276,24 @@ class DesktopModeTests(unittest.TestCase):
         self.assertFalse(ds.should_allow_close(lambda: True, lambda: False))
         self.assertTrue(ds.should_allow_close(lambda: True, lambda: True))
 
+    def test_module_stays_importable_off_windows(self):
+        """模块级绑定 WinDLL 会让非 Windows 上连 import 都崩；Linux CI 曾因此变红.
+
+        Windows 上语义不变（照样绑定 kernel32/user32），非 Windows 上必须能导入，
+        并且把「没有互斥量/没有窗口 API」表达成明确的返回值而不是异常。
+        """
+        import desktop_shell as ds
+
+        self.assertIsInstance(ds.IS_WINDOWS, bool)
+        if sys.platform == "win32":
+            self.assertTrue(ds.IS_WINDOWS)
+            self.assertIsNotNone(ds._kernel32)
+            self.assertIsNotNone(ds._user32)
+        else:
+            self.assertFalse(ds.IS_WINDOWS)
+            self.assertIsNone(ds._kernel32)
+            self.assertFalse(ds.webview2_runtime_installed())
+            self.assertTrue(ds.acquire_single_instance())
+            self.assertFalse(ds.activate_existing_window("任意标题", timeout_s=0.1))
+
 
