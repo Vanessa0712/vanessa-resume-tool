@@ -1769,6 +1769,136 @@ class P1RestoreUploadsTests(unittest.TestCase):
                                  "pre-restore 备份必须包含被覆盖前的原件")
 
 
+class P2RestoreGuardTests(unittest.TestCase):
+    """恢复备份的解压护栏：条目数与累计字节双限，超限一律不动现有数据."""
+
+    def _build_archive(self, root: Path, uploads: dict[str, bytes]) -> Path:
+        src_db = root / "src.db"
+        conn = rt.get_conn(str(src_db))
+        try:
+            conn.execute(
+                "INSERT INTO resumes(filename, path, sha256, text, imported_at)"
+                " VALUES(?,?,?,?,?)",
+                ("bak.txt", "", uuid.uuid4().hex, "备份包内容", rt.now()))
+            conn.commit()
+        finally:
+            conn.close()
+        archive = root / "backup.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.write(src_db, "resume_tool.db")
+            for name, data in uploads.items():
+                zf.writestr(f"uploads/{name}", data)
+        return archive
+
+    def _prepare_dst(self, root: Path) -> tuple[Path, Path]:
+        dst = root / "dst"
+        (dst / "uploads").mkdir(parents=True)
+        (dst / "uploads" / "a.txt").write_text("恢复前原件", encoding="utf-8")
+        dst_db = dst / "resume_tool.db"
+        conn = rt.get_conn(str(dst_db))
+        try:
+            conn.execute(
+                "INSERT INTO resumes(filename, path, sha256, text, imported_at)"
+                " VALUES(?,?,?,?,?)",
+                ("old.txt", "", uuid.uuid4().hex, "老库", rt.now()))
+            conn.commit()
+        finally:
+            conn.close()
+        return dst, dst_db
+
+    def _restore(self, dst: Path, dst_db: Path, archive: Path, **overrides) -> None:
+        env = dict(DB=str(dst_db), DATA_DIR=dst, UPLOAD_DIR=dst / "uploads",
+                   BACKUP_DIR=dst / "backups", TRASH_DIR=dst / ".trash")
+        env.update(overrides)
+        with patch.multiple(appmod, **env):
+            with appmod.app.app_context():
+                appmod.restore_backup(archive)
+
+    def _assert_untouched(self, dst: Path, dst_db: Path) -> None:
+        self.assertEqual((dst / "uploads" / "a.txt").read_text(encoding="utf-8"),
+                         "恢复前原件", "失败时不能改动现有原件")
+        conn = rt.get_conn(str(dst_db))
+        try:
+            names = [r["filename"] for r in conn.execute("SELECT filename FROM resumes")]
+        finally:
+            conn.close()
+        self.assertIn("old.txt", names, "失败时不能替换现有数据库")
+        self.assertNotIn("bak.txt", names)
+        self.assertFalse((dst / appmod.RESTORE_STAGE_NAME).exists(), "暂存区必须清理")
+
+    def test_entry_count_limit_rejects_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = self._build_archive(
+                root, {f"f{i}.txt": b"x" for i in range(3)})
+            dst, dst_db = self._prepare_dst(root)
+            with self.assertRaises(ValueError) as ctx:
+                self._restore(dst, dst_db, archive, RESTORE_MAX_ENTRIES=2)
+            self.assertIn("原始文件超过", str(ctx.exception))
+            self._assert_untouched(dst, dst_db)
+
+    def test_declared_total_bytes_limit_rejects_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = self._build_archive(
+                root, {"a.bin": b"x" * 80, "b.bin": b"y" * 80})
+            dst, dst_db = self._prepare_dst(root)
+            with self.assertRaises(ValueError) as ctx:
+                self._restore(dst, dst_db, archive, RESTORE_MAX_UPLOAD_BYTES=100)
+            self.assertIn("总量超过", str(ctx.exception))
+            self._assert_untouched(dst, dst_db)
+
+    def test_actual_decompressed_bytes_limit_rejects_archive(self):
+        """声明值可伪造，必须按真实解压量拦截（压缩炸弹形态）."""
+        real_open = zipfile.ZipFile.open
+
+        def bomb_open(self, name, *args, **kwargs):
+            handle = real_open(self, name, *args, **kwargs)
+            fname = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if not (isinstance(fname, str) and fname.startswith("uploads/")):
+                return handle
+
+            class _Bomb:
+                """声明 20 字节，实际无限产出，模拟高压缩比条目."""
+
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def read(self, n=-1):
+                    return b"x" * (n if isinstance(n, int) and n > 0 else 1024 * 1024)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self._inner.close()
+                    return False
+
+            return _Bomb(handle)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = self._build_archive(root, {"bomb.txt": b"x" * 20})
+            dst, dst_db = self._prepare_dst(root)
+            with patch.object(zipfile.ZipFile, "open", bomb_open):
+                with self.assertRaises(ValueError) as ctx:
+                    self._restore(dst, dst_db, archive, RESTORE_MAX_UPLOAD_BYTES=10000)
+            self.assertIn("实际解压量", str(ctx.exception))
+            self._assert_untouched(dst, dst_db)
+
+    def test_normal_restore_still_works_and_cleans_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = self._build_archive(root, {"a.txt": "备份包内容".encode("utf-8")})
+            dst, dst_db = self._prepare_dst(root)
+            self._restore(dst, dst_db, archive)
+
+            self.assertEqual((dst / "uploads" / "a.txt").read_text(encoding="utf-8"),
+                             "备份包内容", "正常恢复仍应覆盖原件")
+            self.assertFalse((dst / appmod.RESTORE_STAGE_NAME).exists(),
+                             "恢复成功后暂存区必须清理")
+
+
 class P1HistorySnapshotTests(unittest.TestCase):
     """清除历史：先存档后删除；有任务在跑或快照失败时一律不动数据."""
 
