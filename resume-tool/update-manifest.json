@@ -1,13 +1,12 @@
 {
-  "version": "ver1.0.1",
+  "version": "ver1.0.2",
   "channel": "Beta",
   "date": "2026-11-17",
-  "title": "Beta 1.0.1：恢复备份解压护栏与 Windows 安装包",
+  "title": "Beta 1.0.2：修复表单提交被误判为 403",
   "notes": [
-    "恢复备份新增解压护栏：条目数上限 5000、单文件 256MB、累计解压上限 1GB，按实际解压字节拦截压缩炸弹",
-    "超限时在写入上传目录前中止，恢复失败不留半截文件，启动时自动清理残留暂存目录",
-    "新增 Windows 安装包：中文向导、无需管理员权限，卸载不影响数据目录中的简历与备份",
-    "新增程序图标与 exe 版本信息；设置页新增退出程序入口"
+    "修复 1.0.1 上传等表单提交一律 403：Referrer-Policy 改为 same-origin，浏览器不再把同源表单 Origin 置为 null",
+    "同源校验补充 Sec-Fetch-Site: same-origin 兜底，跨站来源仍一律拒绝",
+    "恢复的操作：简历上传/目录导入、模板导入、设置保存、备份恢复、批量删除、清空历史、退出程序"
   ],
   "download_url": "https://github.com/Vanessa0712/vanessa-resume-tool/releases"
 }

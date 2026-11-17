@@ -217,21 +217,34 @@ def configure_logging() -> None:
 
 @app.before_request
 def protect_local_mutations():
-    """本地写操作只接受同源页面发起，挡住跨站表单提交的基本路径."""
+    """本地写操作只接受同源页面发起，挡住跨站表单提交的基本路径.
+
+    注意 Fetch 规范的一条细节：请求的 referrer policy 为 no-referrer 时，
+    浏览器会把同源表单 POST 的 Origin 序列化成字面量 "null"。因此不能只认
+    Origin/Referer，还要接受 Sec-Fetch-Site: same-origin 作为同源证据——
+    该头同样由浏览器写入且页面脚本无法伪造；跨站场景下它的值是
+    cross-site，伪造不出 same-origin。
+    """
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     allowed = {request.host_url.rstrip("/"), "http://127.0.0.1:5000", "http://localhost:5000"}
-    origin_header = request.headers.get("Origin")
+    origin = (request.headers.get("Origin") or "").rstrip("/")
     referer = request.headers.get("Referer") or ""
-    if not origin_header and not referer:
-        # 本机页面写操作也应带来源；两者都缺失时不再默认放行跨站表单。
-        abort(403)
-    origin = (origin_header or "").rstrip("/")
-    if origin and origin not in allowed:
+    fetch_site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+
+    # "null" 是浏览器在 no-referrer 策略下对同源表单序列化的占位值，不具判定力，
+    # 按「未提供」处理；真正的同源证据交给下面的 Sec-Fetch-Site 兜底。
+    has_origin = bool(origin) and origin != "null"
+    if has_origin and origin not in allowed:
         abort(403)
     if referer and not any(referer.startswith(base + "/") for base in allowed):
         abort(403)
-    return None
+    if has_origin or referer:
+        return None
+    if fetch_site == "same-origin":
+        return None
+    # Origin 缺失或为 null、Referer 也没有、且无同源标记：不再默认放行。
+    abort(403)
 
 
 _URL_QUERY_VALUE_RE = re.compile(r"([?&][A-Za-z_][A-Za-z0-9_]*=)[^&\s\"']+")
@@ -271,11 +284,26 @@ def set_security_headers(response):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    # 必须是 same-origin 而不是 no-referrer：后者会让浏览器按 Fetch 规范把
+    # 同源表单 POST 的 Origin 置为 "null"，同源校验将无法通过（上传等写操作 403）。
+    # same-origin 只对本站发送完整 Referer，跨站一律不发，不泄露路径。
+    response.headers.setdefault("Referrer-Policy", "same-origin")
     return response
 
 # 进入页面时弹出一次；改版本号或日期即再次对全员弹出
 CHANGELOG = [
+    {
+        "version": "ver1.0.2",
+        "channel": "Beta",
+        "date": "2026-11-17",
+        "title": "Beta 1.0.2：修复表单提交被误判为 403",
+        "entries": [
+            "修复 1.0.1 中上传等表单提交一律报 403 的问题：Referrer-Policy 由 no-referrer 改为 same-origin，浏览器不会再按 Fetch 规范把同源表单的 Origin 置为 null",
+            "同源校验补充 Sec-Fetch-Site: same-origin 作为兜底证据；跨站来源仍然一律拒绝，安全性不变",
+            "受影响的操作已恢复：简历上传与目录导入、模板导入、设置保存、备份恢复、批量删除、清空历史、退出程序",
+            "附带改善：同源 Referer 恢复正常后，删除等操作会回到来源页并保留搜索词与页码",
+        ],
+    },
     {
         "version": "ver1.0.1",
         "channel": "Beta",

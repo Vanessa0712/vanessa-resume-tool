@@ -1471,7 +1471,9 @@ class P0SecurityTests(unittest.TestCase):
         self.assertEqual(response.headers.get("Content-Security-Policy"),
                          "frame-ancestors 'none'")
         self.assertEqual(response.headers.get("X-Content-Type-Options"), "nosniff")
-        self.assertEqual(response.headers.get("Referrer-Policy"), "no-referrer")
+        # 不能是 no-referrer：那会让浏览器把同源表单 POST 的 Origin 置为 "null"，
+        # 导致上传等写操作被同源校验拦下（见 BelowOriginRegressionTests）。
+        self.assertEqual(response.headers.get("Referrer-Policy"), "same-origin")
 
     def test_secret_key_is_random_and_persistent(self):
         self.assertNotEqual(appmod.app.secret_key, "resume-tool-local-dev")
@@ -1489,6 +1491,35 @@ class P0SecurityTests(unittest.TestCase):
         raw_client = appmod.app.test_client()  # 不使用测试默认 Origin
         response = raw_client.post("/settings/preview", data={"preview_method": "default"})
         self.assertEqual(response.status_code, 403)
+
+    def test_null_origin_with_same_site_marker_is_accepted(self):
+        """真实浏览器在 no-referrer 策略下会把同源表单 POST 的 Origin 置为
+        字面量 "null"，此时必须靠 Sec-Fetch-Site 识别同源，否则写操作全 403."""
+        raw_client = appmod.app.test_client()
+        response = raw_client.post(
+            "/settings/preview", data={"preview_method": "default"},
+            headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"})
+        self.assertNotEqual(response.status_code, 403)
+
+    def test_null_origin_with_cross_site_marker_is_rejected(self):
+        raw_client = appmod.app.test_client()
+        response = raw_client.post(
+            "/settings/preview", data={"preview_method": "default"},
+            headers={"Origin": "null", "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_null_origin_without_any_evidence_is_rejected(self):
+        raw_client = appmod.app.test_client()
+        response = raw_client.post(
+            "/settings/preview", data={"preview_method": "default"},
+            headers={"Origin": "null"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_referrer_policy_stays_compatible_with_origin_header(self):
+        """策略头不能是 no-referrer，否则浏览器会清空同源表单的 Origin."""
+        policy = self.client.get("/settings").headers.get("Referrer-Policy")
+        self.assertNotEqual(policy, "no-referrer")
+
 
     def test_provider_url_rejects_ssrf_and_host_spoofing(self):
         bad_urls = (
@@ -2122,3 +2153,30 @@ class ShutdownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class UploadFormSameOriginTests(unittest.TestCase):
+    """上传表单在真实浏览器同源提交时必须入库，不能被同源校验误伤."""
+
+    def setUp(self):
+        appmod.app.config.update(TESTING=True)
+
+    def test_upload_browser_like_request_imports_file(self):
+        client = appmod.app.test_client()
+        payload = ("张三\n手机 13800000000 邮箱 zhangsan@example.com\n"
+                   "熟悉 Python 与 Flask 后端开发。\n").encode("utf-8")
+        data = {"files": (BytesIO(payload), "browser-upload.txt")}
+        response = client.post(
+            "/import-files", data=data, content_type="multipart/form-data",
+            headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"})
+        self.assertNotEqual(response.status_code, 403)
+
+    def test_upload_from_cross_site_is_still_rejected(self):
+        client = appmod.app.test_client()
+        payload = b"cross site attempt"
+        data = {"files": (BytesIO(payload), "x.txt")}
+        response = client.post(
+            "/import-files", data=data, content_type="multipart/form-data",
+            headers={"Origin": "null", "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(response.status_code, 403)
+
+
