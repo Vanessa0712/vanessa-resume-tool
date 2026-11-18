@@ -513,7 +513,25 @@ def adopt_legacy_files(conn) -> int:
 
 
 DEPT_ORDER = ["人事", "电气", "业务", "IT"]
-TEMPLATE_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+# 模板文件名（slug）：小写字母/数字/汉字/连字符。汉字直接可用，不必转拼音——
+# 中文岗位名转拼音后既难辨认，还容易在重名时意外覆盖。
+TEMPLATE_SLUG_RE = re.compile(r"[a-z0-9\u4e00-\u9fff][a-z0-9\u4e00-\u9fff-]*\Z")
+TEMPLATE_SLUG_MAX = 40
+# Windows 保留设备名：con.json 这类文件名在 Windows 上无法创建
+_WIN_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+
+
+def slug_ok(slug: str) -> bool:
+    """模板文件名是否合法：字符白名单 + 长度上限 + Windows 设备名规避."""
+    if not slug or len(slug) > TEMPLATE_SLUG_MAX:
+        return False
+    if TEMPLATE_SLUG_RE.fullmatch(slug) is None:
+        return False
+    return slug not in _WIN_RESERVED_NAMES
 
 
 def dept_sort_key(dept: str) -> tuple:
@@ -521,8 +539,8 @@ def dept_sort_key(dept: str) -> tuple:
 
 
 def template_dest(slug: str) -> Path | None:
-    """模板写入路径：只接受小写 slug，并确认最终路径仍在模板目录内."""
-    if not TEMPLATE_SLUG_RE.fullmatch(slug or ""):
+    """模板写入路径：只接受合法 slug，并确认最终路径仍在模板目录内."""
+    if not slug_ok(slug or ""):
         return None
     base = TPL_DIR.resolve()
     path = (base / f"{slug}.json").resolve()
@@ -911,7 +929,7 @@ def restore_backup(archive: Path) -> dict:
                                 config_entries[name] = zf.read(item)
                         elif name.startswith("config/templates/") and name.endswith(".json"):
                             slug = name[len("config/templates/"):-len(".json")]
-                            if re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug) \
+                            if slug_ok(slug) \
                                     and item.file_size <= 5 * 1024 * 1024:
                                 config_entries[name] = zf.read(item)
                         elif name.startswith("uploads/") and not name.endswith("/"):
@@ -1595,6 +1613,38 @@ def divergence_map(conn, template: str | None = None,
 
 # ---------- 路由：简历库 ----------
 
+def _sort_ids(conn, ids: list[int], field: str, order: str,
+              latest: dict[int, dict[str, dict]]) -> list[int]:
+    """列表页排序。字段含义：time=导入时间、name=文件名、kw/ai=对应引擎最新分、
+    score=综合分（AI 优先，缺则关键词）、relevance=搜索相关度（上游已排好）.
+
+    分数类排序时，「未筛选」的简历固定排在末尾，与升/降序无关——
+    倒序看头部候选人时不希望没分数的行插进来。
+    """
+    if field == "relevance":
+        return ids
+    if field == "time":
+        return sorted(ids, reverse=(order == "desc"))
+    if field == "name":
+        names = {r["id"]: r["filename"] for r in conn.execute(
+            "SELECT id, filename FROM resumes WHERE deleted_at IS NULL").fetchall()}
+        return sorted(ids, key=lambda rid: (names.get(rid, "\uffff"), rid),
+                      reverse=(order == "desc"))
+
+    def item_of(rid: int):
+        per = latest.get(rid, {})
+        if field == "kw":
+            return per.get("keyword")
+        if field == "ai":
+            return per.get("ai")
+        return per.get("ai") or per.get("keyword")
+
+    have = [rid for rid in ids if item_of(rid)]
+    missing = [rid for rid in ids if not item_of(rid)]
+    have.sort(key=lambda rid: (item_of(rid)["score"], rid), reverse=(order == "desc"))
+    return have + missing
+
+
 @app.get("/")
 def library():
     conn = db()
@@ -1627,6 +1677,21 @@ def library():
     review_only = request.args.get("review") == "1"
     if review_only:
         ids = review_ids
+
+    # 每个模板下「建议复核」的简历数：供模板搜索面板用小气泡标注，
+    # 这样不切换模板也能看出哪个岗位的候选人需要人力复核
+    tpl_review_counts = template_review_counts(groups)
+
+    # 排序：默认搜索时按相关度、否则按导入时间倒序；非法值一律回退到默认
+    sort_field = request.args.get("sort", "").strip()
+    if sort_field not in {"time", "name", "kw", "ai", "score", "relevance"}:
+        sort_field = "relevance" if q else "time"
+    if not q and sort_field == "relevance":
+        sort_field = "time"
+    sort_order = request.args.get("order", "desc").strip().lower()
+    if sort_order not in ("asc", "desc"):
+        sort_order = "desc"
+    ids = _sort_ids(conn, ids, sort_field, sort_order, latest)
 
     per_page = 15
     total = len(ids)
@@ -1673,6 +1738,8 @@ def library():
                            q=q, matched=len(ids),
                            review_only=review_only, review_count=len(review_ids),
                            review_gap=REVIEW_GAP,
+                           sort_field=sort_field, sort_order=sort_order,
+                           tpl_review_counts=tpl_review_counts,
                            pager_info={"page": page, "pages": pages, "total": total,
                                   "per_page": per_page,
                                   "window": _page_window(page, pages)},
@@ -2369,8 +2436,27 @@ def export_csv():
 
 # ---------- 路由：候选人（同人多版本聚合） ----------
 
-def _person_groups(conn, q: str = "") -> list[dict]:
-    """把在库简历按候选人聚合，返回按最新版本排序的分组列表."""
+def template_review_counts(groups: dict[int, dict[str, dict]]) -> dict[str, int]:
+    """每个模板下「建议复核」的简历数（按模板分组后比双引擎分差）.
+
+    简历库与候选人页的模板搜索面板共用：不切换模板也能看出哪个岗位需要
+    人力看原文裁决。
+    """
+    out: dict[str, int] = {}
+    for per in groups.values():
+        for tpl_key, engines in per.items():
+            if diff_flag(engines):
+                out[tpl_key] = out.get(tpl_key, 0) + 1
+    return out
+
+
+def _person_groups(conn, q: str = "", template: str | None = None) -> list[dict]:
+    """把在库简历按候选人聚合，返回按最新版本排序的分组列表.
+
+    template 给定时只保留该模板下筛过的候选人，并展示「该模板下最新一份
+    有结果的版本」；不给定时展示最新版本，模板口径与简历库一致（优先分歧
+    模板、其次双引擎齐全），避免关键词分与 AI 分来自两个不同模板。
+    """
     rows = conn.execute(
         "SELECT r.id, r.person_id, r.filename, r.imported_at, LENGTH(r.text) AS chars,"
         " p.name, p.phone, p.email"
@@ -2400,18 +2486,44 @@ def _person_groups(conn, q: str = "") -> list[dict]:
         })
         g["versions"].append(dict(r))
 
-    latest_all = latest_map(conn)
+    snapshot = screening_snapshot(conn)
+    groups_eng = snapshot["groups"]
+    flags = divergence_map(conn, snapshot=snapshot)
+
+    def _view(version: dict, engines: dict, flag: dict | None) -> dict:
+        """同一份简历的展示口径：双引擎取自同一模板，附带复核标记."""
+        best = engines.get("ai") or engines.get("keyword")
+        return {"keyword": engines.get("keyword"), "ai": engines.get("ai"),
+                "status": best["status"] if best else "未筛选",
+                "score": best["score"] if best else None,
+                "template": best["template"] if best else None,
+                "review": flag if best else None}
+
     items = []
     for pid, g in groups.items():
-        latest = g["versions"][0]
-        engines = latest_all.get(latest["id"], {})
-        best = engines.get("ai") or engines.get("keyword")
+        if template:
+            picked_v, picked_e = None, {}
+            for v in g["versions"]:  # 版本已按导入时间倒序
+                engines = groups_eng.get(v["id"], {}).get(template, {})
+                if engines:
+                    picked_v, picked_e = v, engines
+                    break
+            if picked_v is None:
+                continue
+            view = _view(picked_v, picked_e, diff_flag(picked_e))
+            latest = picked_v
+        else:
+            latest = g["versions"][0]
+            per = groups_eng.get(latest["id"], {})
+            flag = flags.get(latest["id"])
+            picked_tpl = _display_template(per, flag)
+            engines = per.get(picked_tpl, {})
+            view = _view(latest, engines, flag if flag and flag.get("template") == picked_tpl else None)
         items.append({
             **g, "latest": latest, "count": len(g["versions"]),
-            "keyword": engines.get("keyword"), "ai": engines.get("ai"),
-            "status": best["status"] if best else "未筛选",
-            "score": best["score"] if best else None,
-            "template": best["template"] if best else None,
+            "keyword": view["keyword"], "ai": view["ai"],
+            "status": view["status"], "score": view["score"],
+            "template": view["template"], "review": view["review"],
             "multi": len(g["versions"]) > 1,
         })
     if q:
@@ -2423,7 +2535,14 @@ def _person_groups(conn, q: str = "") -> list[dict]:
 def persons():
     conn = db()
     q = request.args.get("q", "").strip()
-    items = _person_groups(conn, q)
+    templates = list_templates()
+    tpl_filter = request.args.get("template", "all")
+    tpl_label = None
+    if tpl_filter != "all" and template_path(tpl_filter) is not None:
+        tpl_label = tpl_name(tpl_filter)
+    else:
+        tpl_filter = "all"
+    items = _person_groups(conn, q, template=tpl_label)
 
     per_page = 15
     total = len(items)
@@ -2437,7 +2556,13 @@ def persons():
     for it in items:
         stats[it["status"]] += 1
 
+    # 模板面板的「N 复核」气泡：与简历库同一口径（按模板分组比双引擎分差）
+    tpl_review_counts = template_review_counts(screening_snapshot(conn)["groups"])
+
     return render_template("persons.html", items=page_items, stats=stats, q=q,
+                           templates=templates, tpl_filter=tpl_filter,
+                           tpl_label=tpl_label, tpl_review_counts=tpl_review_counts,
+                           review_gap=REVIEW_GAP,
                            pager_info={"page": page, "pages": pages, "total": total,
                                        "per_page": per_page,
                                        "window": _page_window(page, pages)},
@@ -2743,7 +2868,7 @@ def template_edit(slug: str):
 def template_save(slug: str):
     dest = template_dest(slug)
     if dest is None:
-        flash("模板文件名只允许小写字母/数字/连字符", "error")
+        flash("模板文件名只允许小写字母、数字、汉字和连字符", "error")
         return redirect(url_for("templates_page"))
     content = request.form.get("content", "")
     tmp = TPL_DIR / f".{slug}.validate.json"
@@ -2764,20 +2889,44 @@ def template_save(slug: str):
     return redirect(url_for("template_edit", slug=slug))
 
 
+def _default_template_payload(name: str) -> dict:
+    """新建模板的骨架配置：自带可跑通的最小结构.
+
+    早期实现固定拷贝 python-backend.json 作种子，用户把该模板删进暂存区后
+    新建模板就 500。骨架不绑定任何行业，占位技能等用户按岗位改写。
+    """
+    return {
+        "name": name,
+        "hard_gates": {"required_skills": ["core"], "min_years": 2,
+                       "strict_years": False},
+        "core_skills": {
+            "core": {"weight": 40, "aliases": ["核心技能", "core"]},
+            "secondary": {"weight": 30, "aliases": ["次要技能", "secondary"]},
+            "tool": {"weight": 20, "aliases": ["工具", "tool"]},
+            "domain": {"weight": 10, "aliases": ["行业", "domain"]},
+        },
+        "nice_to_have": {
+            "extra": {"weight": 5, "aliases": ["加分技能", "extra"]},
+        },
+        "department": "通用",
+        "role": "",
+    }
+
+
 @app.post("/templates-new")
 def template_new():
     slug = request.form.get("slug", "").strip()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug):
-        flash("模板文件名只允许小写字母/数字/连字符（如 data-analyst）", "error")
+    if not slug_ok(slug):
+        flash("模板文件名只允许小写字母、数字、汉字和连字符，且不超过 40 字"
+              "（如 电子维修技术员 / data-analyst）", "error")
         return redirect(url_for("templates_page"))
     dest = TPL_DIR / f"{slug}.json"
     if dest.exists():
         flash("同名模板已存在", "error")
         return redirect(url_for("templates_page"))
-    default = json.loads((TPL_DIR / "python-backend.json").read_text(encoding="utf-8"))
-    default["name"] = slug
+    default = _default_template_payload(slug)
     dest.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
-    flash("已基于默认模板创建，请修改技能配置后保存")
+    flash("已创建模板骨架：请把占位技能改成该岗位的必备技能、权重与别名后保存")
     return redirect(url_for("template_edit", slug=slug))
 
 
@@ -2801,7 +2950,12 @@ def template_import():
             skipped.append(f"{f.filename}（无法解析：{exc}）")
             continue
 
-        base = re.sub(r"[^a-z0-9-]", "-", Path(f.filename).stem.lower()).strip("-") or "template"
+        # 文件名沿用原模板名（汉字保留），仅把非法字符压成连字符
+        stem = Path(f.filename).stem.strip().lower()
+        base = re.sub(r"[^a-z0-9\u4e00-\u9fff-]+", "-", stem).strip("-") or "模板"
+        base = base[:TEMPLATE_SLUG_MAX]
+        if base in _WIN_RESERVED_NAMES:
+            base += "-1"
         slug, n = base, 2
         while (TPL_DIR / f"{slug}.json").exists():
             slug, n = f"{base}-{n}", n + 1
@@ -2879,7 +3033,7 @@ def template_restore(slug: str):
         return redirect(url_for("templates_page"))
     dest = template_dest(slug)
     if dest is None:
-        flash("模板文件名只允许小写字母/数字/连字符", "error")
+        flash("模板文件名只允许小写字母、数字、汉字和连字符", "error")
         return redirect(url_for("templates_page"))
     src = TRASH_DIR / folder / f"{slug}.json"
     if not src.is_file():
@@ -3033,6 +3187,12 @@ def charts():
 
 
 # ---------- 路由：更新日志（历史公告） ----------
+
+@app.get("/help")
+def help_page():
+    """使用说明（侧栏底部入口）：新用户上手路径 + 各页面职责 + 模板写法."""
+    return render_template("help.html", active="help")
+
 
 @app.get("/changelog")
 def changelog():

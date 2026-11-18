@@ -305,3 +305,55 @@ document.querySelectorAll('.tpl-card [data-fav]').forEach(btn => {
     } catch (err) { /* 忽略网络错误 */ }
   });
 });
+
+// ---- 简历库：模板搜索面板（搜索模板名/技能/部门，回车直达首项） ----
+(function () {
+  const btn = document.getElementById('tpl-pick-btn');
+  const panel = document.getElementById('tpl-pick-panel');
+  if (!btn || !panel) return;
+  const search = document.getElementById('tpl-pick-search');
+  const empty = document.getElementById('tpl-pick-empty');
+  const items = Array.from(panel.querySelectorAll('[data-tpl-item], [data-tpl-all]'));
+  const groups = Array.from(panel.querySelectorAll('.tpl-pick-group'));
+
+  const setOpen = open => {
+    panel.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+    if (open) search.focus();
+  };
+  btn.addEventListener('click', e => { e.stopPropagation(); setOpen(panel.hidden); });
+  document.addEventListener('click', e => {
+    if (!panel.hidden && !panel.contains(e.target)) setOpen(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !panel.hidden) setOpen(false);
+  });
+
+  const visible = () => items.filter(it => !it.hidden);
+
+  const applyFilter = () => {
+    const q = search.value.trim().toLowerCase();
+    items.forEach(it => {
+      const hay = (it.dataset.search || '').toLowerCase();
+      it.hidden = q !== '' && !hay.includes(q);
+    });
+    // 分组标题跟着组内可见项显隐，避免一片空标题
+    groups.forEach(g => {
+      let sib = g.nextElementSibling, any = false;
+      while (sib && !sib.classList.contains('tpl-pick-group')) {
+        if (sib.matches('[data-tpl-item]') && !sib.hidden) { any = true; break; }
+        sib = sib.nextElementSibling;
+      }
+      g.hidden = !any;
+    });
+    empty.hidden = visible().length > 0;
+  };
+  search.addEventListener('input', applyFilter);
+
+  // 回车直达首个匹配模板：审查时不用鼠标点选
+  search.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const first = visible()[0];
+    if (first) { e.preventDefault(); window.location.href = first.href; }
+  });
+})();

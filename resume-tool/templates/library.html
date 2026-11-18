@@ -1,5 +1,18 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge, engine_cell, pager %}
+{% from "_macros.html" import badge, engine_cell, pager, tpl_pick %}
+
+{# 可排序表头：点击按该字段排序，再次点击切换正序/倒序 #}
+{% macro sort_th(field, label, class='') -%}
+{%- set flip = 'asc' if (sort_field == field and sort_order == 'desc') else 'desc' -%}
+{%- set arrow = ('↓' if sort_order == 'desc' else '↑') if sort_field == field else '' -%}
+<th class="{{ class }}">
+  <a class="th-sort {{ 'on' if sort_field == field }}" title="按{{ label }}排序，再次点击切换正序/倒序"
+     href="{{ url_for('library', template=tpl_filter, q=q or none,
+                      review=1 if review_only else none, sort=field, order=flip,
+                      _anchor='list') }}">{{ label }}{% if arrow %}<span class="sort-arrow">{{ arrow }}</span>{% endif %}</a>
+</th>
+{%- endmacro %}
+
 {% block title %}简历库{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -84,20 +97,9 @@
         <button class="btn btn-sm btn-primary" type="submit">搜索</button>
         {% if q %}<a class="btn btn-sm btn-secondary" href="{{ url_for('library', template=tpl_filter, review=1 if review_only else none) }}">清除</a>{% endif %}
       </form>
-      <form method="get" action="{{ url_for('library') }}" class="tpl-filter">
-        <input type="hidden" name="q" value="{{ q }}">
-        {% if review_only %}<input type="hidden" name="review" value="1">{% endif %}
-        <select name="template" onchange="this.form.submit()" title="按模板查看">
-          <option value="all" {{ 'selected' if tpl_filter == 'all' }}>全部模板（自动择优）</option>
-          {% for dept, items in templates|groupby('department') %}
-          <optgroup label="{{ dept }}">
-            {% for t in items %}
-            <option value="{{ t.slug }}" {{ 'selected' if tpl_filter == t.slug }}>{{ t.name }}{% if t.role %}（{{ t.role }}）{% endif %}</option>
-            {% endfor %}
-          </optgroup>
-          {% endfor %}
-        </select>
-      </form>
+      {{ tpl_pick('library', templates, tpl_filter, tpl_label, tpl_review_counts, review_gap, q,
+                  {'sort': sort_field, 'order': sort_order,
+                   'review': 1 if review_only else none}) }}
       {% if resumes %}
       <button class="icon-btn" id="multi-toggle" type="button" title="多选批量管理">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6l1.4 1.4L8 4.8M4 12l1.4 1.4L8 10.8M4 18l1.4 1.4L8 16.8"/></svg>
@@ -120,8 +122,14 @@
         <thead>
           <tr>
             <th class="th-check"><input type="checkbox" id="check-all" title="全选"></th>
-            <th>ID</th><th>文件名</th><th>字符数</th><th>关键词结果</th><th>AI 结果</th>
-            <th>结果模板</th><th>导入时间</th><th class="th-actions">操作</th>
+            <th>ID</th>
+            {{ sort_th('name', '文件名') }}
+            <th>字符数</th>
+            {{ sort_th('kw', '关键词结果') }}
+            {{ sort_th('ai', 'AI 结果') }}
+            <th>结果模板</th>
+            {{ sort_th('time', '导入时间') }}
+            <th class="th-actions">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -161,7 +169,7 @@
       </table>
     </div>
 
-    {% set pargs = {'template': tpl_filter} %}
+    {% set pargs = {'template': tpl_filter, 'sort': sort_field, 'order': sort_order} %}
     {% if q %}{% set _ = pargs.update({'q': q}) %}{% endif %}
     {% if review_only %}{% set _ = pargs.update({'review': 1}) %}{% endif %}
     {{ pager(pager_info.page, pager_info.pages, pager_info.total, pager_info.per_page,

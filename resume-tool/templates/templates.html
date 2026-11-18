@@ -15,7 +15,9 @@
 <div class="card">
   <div class="card-title">新建模板</div>
   <form method="post" action="{{ url_for('template_new') }}" class="inline-form">
-    <input type="text" name="slug" placeholder="模板文件名，如 data-analyst（小写字母/数字/连字符）" required>
+    <input type="text" name="slug" maxlength="40"
+           placeholder="模板文件名，可用汉字，如 电子维修技术员 或 data-analyst"
+           required>
     <button class="btn btn-primary" type="submit">基于默认模板创建</button>
   </form>
 </div>

@@ -39,6 +39,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import sys
@@ -190,6 +191,46 @@ def extract_doc(path: Path) -> str:
     return _doc_via_word_com(path)  # 真二进制 .doc
 
 
+_CJK_RANGE = "\u4e00-\u9fff\u3400-\u4dbf"
+
+
+def _tidy_text(text: str) -> str:
+    """清洗 PDF 抽取噪声，让解析文本预览可读.
+
+    三件事：重复水印行只保留首次出现、去掉中文字符间的抽取伪空格、
+    连续空行压缩为一行。只做保守清洗，不动文字内容本身。
+    """
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    counts: dict[str, int] = {}
+    for ln in lines:
+        s = ln.strip()
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+    dropped: set[str] = set()
+    out: list[str] = []
+    blank = 0
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            blank += 1
+            if blank <= 1 and out:
+                out.append("")
+            continue
+        blank = 0
+        if counts[s] >= 3:  # 同一行出现 3 次以上：页眉/页脚/水印，保留首次
+            if s in dropped:
+                continue
+            dropped.add(s)
+        # 中文字符间的伪空格（"广 西 容 县" -> "广西容县"），仅剔除 CJK-CJK 之间的
+        s = re.sub(rf"(?<=[{_CJK_RANGE}])[ \t]+(?=[{_CJK_RANGE}])", "", s)
+        # 尾部水印串（"fe35308...~~" 一类）从行内剥离（layout 模式可能把它与正文同行）
+        s = re.sub(r"[A-Za-z0-9_-]{30,}~{2,}", "", s).strip()
+        if not s:
+            continue
+        out.append(s)
+    return "\n".join(out).strip()
+
+
 def extract_text(path: Path) -> str:
     """按扩展名分发文本抽取；无法解析返回空串（由调用方跳过并告警）."""
     suffix = path.suffix.lower()
@@ -205,7 +246,21 @@ def extract_text(path: Path) -> str:
             return ""
         try:
             reader = PdfReader(str(path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            # 优先 layout 模式（保留视觉排版，减少行碎片）；失败或为空再退回普通模式
+            pages = []
+            for page in reader.pages:
+                chunk = ""
+                try:
+                    chunk = page.extract_text(extraction_mode="layout") or ""
+                except Exception:
+                    chunk = ""
+                if not chunk.strip():
+                    try:
+                        chunk = page.extract_text() or ""
+                    except Exception:
+                        chunk = ""
+                pages.append(chunk)
+            return _tidy_text("\n".join(pages))
         except Exception as exc:
             print(f"[警告] PDF 解析失败 {path.name}: {exc}", file=sys.stderr)
             return ""
@@ -1089,6 +1144,28 @@ def _fetch_resumes(conn: sqlite3.Connection, ids: list[int] | None = None) -> li
 
 # ============ 命令实现 ============
 
+def _copy_into_store(src: Path, dest_dir: Path) -> Path:
+    """把外部文件拷入数据目录 uploads/import；同名不同内容时加短哈希后缀防覆盖.
+
+    拷贝（而非引用原始路径）是刻意的：Web 端出于安全边界只预览数据目录内
+    的文件，外部绝对路径会导致原文件预览 404。
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.exists():
+        src_digest = hashlib.sha256(src.read_bytes()).hexdigest()
+        try:
+            same = hashlib.sha256(dest.read_bytes()).hexdigest() == src_digest
+        except OSError:
+            same = False
+        if same:
+            return dest
+        digest = hashlib.sha256(src.name.encode("utf-8")).hexdigest()[:8]
+        dest = dest_dir / f"{src.stem}_{digest}{src.suffix}"
+    shutil.copy2(src, dest)
+    return dest
+
+
 def _stored_path(path: Path, store_base: Path | None) -> str:
     """存在应用 uploads 下的文件存相对路径，外部目录仍保留绝对路径."""
     resolved = path.resolve()
@@ -1108,6 +1185,18 @@ def import_one_detail(conn: sqlite3.Connection, path: Path,
     if not text.strip():
         return "empty", "未抽取到文本，可能是扫描版 PDF 或旧版 .doc", None
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    # CLI 导入（未传 store_base）：外部目录的文件拷进数据目录 uploads/import，
+    # 否则 Web 端原文件预览会因路径越界而不可用。
+    if store_base is None:
+        upload_root = DATA_DIR / "uploads"
+        try:
+            in_store = path.resolve().is_relative_to(upload_root.resolve())
+        except OSError:
+            in_store = False
+        if not in_store:
+            path = _copy_into_store(path.resolve(), upload_root / "import")
+        store_base = upload_root
     stored_path = _stored_path(path, store_base)
 
     # 同一内容已在库中：回收站里的直接恢复，正常记录按重复跳过

@@ -55,3 +55,43 @@
 </div>
 {%- endif -%}
 {%- endmacro %}
+
+{# 可搜索的模板切换面板（简历库 / 候选人页共用）。
+   counts = {模板名: 建议复核数}，用于在模板右侧标注「N 复核」气泡；
+   extra 传需要保留的查询参数（如 {'sort': sort_field, 'order': sort_order}）。 #}
+{% macro tpl_pick(endpoint, templates, tpl_filter, tpl_label, counts, gap, q='', extra={}) -%}
+{#- Jinja 不允许 **kwargs 后再跟关键字参数，先把公共参数合并成一个 dict -#}
+{%- set base = dict(extra) -%}
+{%- if q %}{% set _ = base.update({'q': q}) %}{% endif -%}
+<div class="tpl-pick" id="tpl-pick">
+  <button class="btn btn-sm btn-secondary tpl-pick-btn" type="button" id="tpl-pick-btn"
+          aria-expanded="false" title="搜索并切换筛选模板">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+    模板：{{ tpl_label or '全部' }}
+  </button>
+  <div class="tpl-pick-panel" id="tpl-pick-panel" hidden>
+    <input type="text" id="tpl-pick-search" class="tpl-pick-search" autocomplete="off"
+           placeholder="搜索模板名 / 技能 / 部门，回车选中首项">
+    <a class="tpl-pick-item {{ 'on' if tpl_filter == 'all' }}"
+       data-tpl-all data-search="全部模板 自动择优 all"
+       href="{{ url_for(endpoint, _anchor='list', **base) }}">
+      <span class="tpl-pick-name">全部模板<span class="tpl-pick-role">自动择优</span></span>
+    </a>
+    {% for dept, items in templates|groupby('department') %}
+    <div class="tpl-pick-group" data-dept>{{ dept }}</div>
+    {% for t in items %}
+    {% set rv = counts.get(t.name, 0) %}
+    {% set params = dict(base) %}{% set _ = params.update({'template': t.slug}) %}
+    <a class="tpl-pick-item {{ 'on' if tpl_filter == t.slug }}"
+       data-tpl-item
+       data-search="{{ t.name }} {{ t.role }} {{ t.department }} {{ t.skills|join(' ') }}"
+       href="{{ url_for(endpoint, _anchor='list', **params) }}">
+      <span class="tpl-pick-name">{{ t.name }}{% if t.role %}<span class="tpl-pick-role">{{ t.role }}</span>{% endif %}</span>
+      {% if rv %}<span class="review-flag" title="该模板下有 {{ rv }} 份简历的关键词分与 AI 分相差 {{ gap }} 分以上，建议切换后看原文裁决">{{ rv }} 复核</span>{% endif %}
+    </a>
+    {% endfor %}
+    {% endfor %}
+    <div class="tpl-pick-empty" id="tpl-pick-empty" hidden>没有匹配的模板，换个关键词试试</div>
+  </div>
+</div>
+{%- endmacro %}

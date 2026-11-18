@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}使用说明{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>使用说明</h1>
+    <p class="subtitle">三步跑通：导入简历 → 选或建模板 → 跑筛选看结果</p>
+  </div>
+  <div class="head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('library') }}">回到简历库</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">三步上手</div>
+  <ol class="help-steps">
+    <li><b>导入简历</b>：在「简历库」页顶部，用「本机目录导入」填文件夹路径，或直接拖拽文件上传。支持 .pdf / .docx / .doc / .txt / .md，按内容哈希自动去重；文件会复制进工具数据目录，Web 端可直接预览原件。</li>
+    <li><b>准备模板</b>：在「模板管理」新建模板（文件名可用汉字，如 <code>电子维修技术员</code>），或导入已有 JSON。模板决定「谁被卡掉、谁得高分」。</li>
+    <li><b>跑筛选</b>：在「筛选中心」勾选模板与引擎，点开始。结果在简历库 / 候选人页查看，可导出 CSV 或 xlsx。</li>
+  </ol>
+  <p class="hint">想省事也可以让 WorkBuddy 代跑，见下方「让 Agent 帮你跑」。</p>
+</div>
+
+<div class="card">
+  <div class="card-title">让 Agent 帮你跑</div>
+  <p class="muted">在 WorkBuddy 里说一句话即可，例如「用 resume-tool 筛『电子维修技术员』的简历」。Agent 会自动完成：关键词初筛 → 导出脱敏批次 → 在本会话里逐份语义评估 → 结果写回同一个库 → 汇报通过名单与边缘名单。全程不需要配置 API Key。</p>
+</div>
+
+<div class="card">
+  <div class="card-title">页面地图</div>
+  <table class="table">
+    <thead><tr><th style="width:110px">页面</th><th>用途</th><th>常用操作</th></tr></thead>
+    <tbody>
+      <tr><td>简历库</td><td>按文件查看全部简历与筛选结果</td><td>点表头排序、模板搜索按钮切模板、只看建议复核、导出报告</td></tr>
+      <tr><td>候选人</td><td>同一人的多份简历归并，展示最新版本</td><td>按模板过滤候选人、看版本对比、复核气泡</td></tr>
+      <tr><td>筛选中心</td><td>批量对「模板 × 简历」打分</td><td>多选模板（可搜技能）、选引擎、限定筛选范围</td></tr>
+      <tr><td>模板管理</td><td>岗位标准：必备门槛 + 技能权重 + 加分项</td><td>新建（汉字命名）、改 JSON、导入导出、收藏</td></tr>
+      <tr><td>图表视图</td><td>分数分布与状态统计</td><td>按模板看通过率与分数段</td></tr>
+      <tr><td>回收站</td><td>删除的简历与模板（保留 30 天）</td><td>恢复、彻底删除</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-title">双引擎与「建议复核」</div>
+  <p class="muted">同一个模板下可以跑两个引擎，分数口径不同：</p>
+  <ul class="help-list">
+    <li><b>关键词引擎</b>（本地、免费、瞬时）：只认模板里写的技能别名。同义表述没写进别名就会漏判——比如简历写「电铬铁」而别名里只有「电烙铁」。</li>
+    <li><b>AI 引擎</b>（需配置 API Key，或让 WorkBuddy 在会话里评估）：读语义，能识别「用热风枪拆焊 BGA」等于焊接能力，但也可能推断过头。</li>
+  </ul>
+  <p class="muted">两者分差 ≥20 分时，行内会标出 <b>建议复核</b> 气泡，悬停可看两侧分数与偏向方向；模板搜索面板里每个模板旁的「N 复核」是该模板下的分歧份数。分歧不代表谁错，而是「值得看原文」的信号。</p>
+</div>
+
+<div class="card">
+  <div class="card-title">模板怎么写</div>
+  <p class="hint">模板就是一份 JSON。必备门槛不满足直接「未通过」；核心技能按权重加权算分；加分项只加分、不卡人。</p>
+  <pre class="help-code">{
+  "name": "电子技术维修员",
+  "hard_gates": {
+    "required_skills": ["repair", "soldering"],   // 必须命中的技能键
+    "min_years": 2,                                // 最低年限
+    "strict_years": false                          // false = 年限不足只标「待核实」
+  },
+  "core_skills": {
+    "repair":    { "weight": 30, "aliases": ["维修", "故障诊断", "电路维修"] },
+    "soldering": { "weight": 20, "aliases": ["焊接", "烙铁", "热风枪", "BGA"] }
+  },
+  "nice_to_have": {
+    "cert": { "weight": 5, "aliases": ["电工证", "职业资格"] }
+  },
+  "department": "制造/售后",
+  "role": "电子维修"
+}</pre>
+  <p class="hint">两个要点：required_skills 里的键必须在 core_skills 或 nice_to_have 中定义；别名越贴近简历原话越好（中英文、俗称都写上）。</p>
+</div>
+
+<div class="card">
+  <div class="card-title">列表小技巧</div>
+  <ul class="help-list">
+    <li>点<b>表头</b>（文件名 / 关键词结果 / AI 结果 / 导入时间）排序，再点一次切换正序倒序；未筛选的简历固定垫底。</li>
+    <li>列表右上的<b>模板搜索按钮</b>：按模板名、技能、部门搜索并切换，回车直达首项。</li>
+    <li>「建议复核」统计卡：一键只看关键词与 AI 分歧的简历，是人工裁决的最短路径。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <div class="card-title">常见问题</div>
+  <dl class="help-faq">
+    <dt>原文件打不开或提示不可用？</dt>
+    <dd>预览只允许数据目录 <code>uploads/</code> 内的文件。目录导入会自动复制进来；若原文件被移动或删除，可重新导入一次。</dd>
+    <dt>删除的简历还能找回吗？</dt>
+    <dd>回收站保留 30 天，可随时恢复；彻底删除会移除记录，磁盘上的原文件是否清理取决于回收站里的选项。</dd>
+    <dt>不配 API Key 能用吗？</dt>
+    <dd>可以。关键词引擎完全本地运行；AI 评估可以让 WorkBuddy 在本会话里代跑，结果照样写回库里。</dd>
+    <dt>数据存在哪里？</dt>
+    <dd>数据库是 SQLite（<code>resume_tool.db</code>），模板在 <code>config/templates/</code>，原文件在 <code>uploads/</code>。设置页可创建备份与恢复整个库。</dd>
+  </dl>
+</div>
+{% endblock %}

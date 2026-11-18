@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import badge, engine_cell, pager %}
+{% from "_macros.html" import badge, engine_cell, pager, tpl_pick %}
 {% block title %}候选人{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -28,12 +28,21 @@
     </div>
     <div class="card-tools">
       <form method="get" action="{{ url_for('persons') }}" class="search-form">
+        <input type="hidden" name="template" value="{{ tpl_filter }}">
         <input type="search" name="q" value="{{ q }}" placeholder="在简历正文中搜索，如 数据、Kafka">
         <button class="btn btn-sm btn-primary" type="submit">搜索</button>
-        {% if q %}<a class="btn btn-sm btn-secondary" href="{{ url_for('persons') }}">清除</a>{% endif %}
+        {% if q %}<a class="btn btn-sm btn-secondary" href="{{ url_for('persons', template=tpl_filter) }}">清除</a>{% endif %}
       </form>
+      {{ tpl_pick('persons', templates, tpl_filter, tpl_label, tpl_review_counts, review_gap, q) }}
     </div>
   </div>
+
+  {% if tpl_label %}
+  <div class="search-summary">
+    当前按「<b>{{ tpl_label }}</b>」查看：只显示该模板下筛过的候选人，结果取该模板下最新一份有结果的简历
+    <a class="link small" href="{{ url_for('persons', q=q or none) }}">回到全部模板</a>
+  </div>
+  {% endif %}
 
   {% if q %}
   <div class="search-summary">搜索「<b>{{ q }}</b>」，命中 <b>{{ pager_info.total }}</b> 位候选人（版本数按该候选人的全部简历统计）</div>
@@ -62,7 +71,16 @@
             {% if not it.phone and not it.email %}—{% endif %}
           </td>
           <td class="muted">{{ it.count }}</td>
-          <td><a class="link" href="{{ url_for('resume_detail', rid=it.latest.id) }}">{{ it.latest.filename }}</a></td>
+          <td>
+            <a class="link" href="{{ url_for('resume_detail', rid=it.latest.id) }}">{{ it.latest.filename }}</a>
+            {% if it.review %}
+            <span class="review-flag"
+                  title="模板「{{ it.review.template }}」下：关键词 {{ it.review.kw_score }} 分 / AI {{ it.review.ai_score }} 分，相差 {{ it.review.gap }} 分。{{ 'AI 认为匹配度更高，可能是关键词漏判（同义表述、英文简历或技能未用别名列出）' if it.review.higher == 'ai' else '关键词命中更高，AI 判定偏严，可能是 AI 对简历表述理解偏差' }}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/></svg>
+              建议复核
+            </span>
+            {% endif %}
+          </td>
           <td>{{ engine_cell(it.keyword) }}</td>
           <td>{{ engine_cell(it.ai) }}</td>
           <td class="muted small">{{ it.template or '—' }}</td>
@@ -85,8 +103,11 @@
     </table>
   </div>
 
+  {% set pargs = {} %}
+  {% if q %}{% set _ = pargs.update({'q': q}) %}{% endif %}
+  {% if tpl_filter != 'all' %}{% set _ = pargs.update({'template': tpl_filter}) %}{% endif %}
   {{ pager(pager_info.page, pager_info.pages, pager_info.total, pager_info.per_page,
-           pager_info.window, 'persons', ({'q': q} if q else {}), '#list', '人') }}
+           pager_info.window, 'persons', pargs, '#list', '人') }}
   {% else %}
   <div class="empty">
     {% if q %}没有命中「{{ q }}」的候选人{% else %}简历库为空，先导入简历{% endif %}

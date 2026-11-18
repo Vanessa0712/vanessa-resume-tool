@@ -1,0 +1,101 @@
+{
+ "name": "电子技术维修员",
+ "hard_gates": {
+  "required_skills": [
+   "repair",
+   "soldering",
+   "instruments"
+  ],
+  "min_years": 2,
+  "strict_years": false
+ },
+ "core_skills": {
+  "repair": {
+   "weight": 30,
+   "aliases": [
+    "维修",
+    "故障诊断",
+    "故障排除",
+    "故障分析",
+    "电路维修",
+    "售后维修",
+    "返修",
+    "repair",
+    "troubleshooting"
+   ]
+  },
+  "soldering": {
+   "weight": 20,
+   "aliases": [
+    "焊接",
+    "锡焊",
+    "烙铁",
+    "smt",
+    "贴片",
+    "soldering"
+   ]
+  },
+  "instruments": {
+   "weight": 20,
+   "aliases": [
+    "万用表",
+    "示波器",
+    "电桥",
+    "稳压电源",
+    "信号发生器",
+    "仪器仪表",
+    "multimeter",
+    "oscilloscope"
+   ]
+  },
+  "electronics": {
+   "weight": 15,
+   "aliases": [
+    "电子电路",
+    "模拟电路",
+    "数字电路",
+    "电路分析",
+    "电子元器件",
+    "电子技术",
+    "pcba",
+    "pcb",
+    "电路板"
+   ]
+  },
+  "quality": {
+   "weight": 15,
+   "aliases": [
+    "产品测试",
+    "测试",
+    "质检",
+    "品质",
+    "检验"
+   ]
+  }
+ },
+ "nice_to_have": {
+  "service": {
+   "weight": 5,
+   "aliases": [
+    "售后服务",
+    "客户服务",
+    "技术支持",
+    "技服",
+    "客服"
+   ]
+  },
+  "cert": {
+   "weight": 5,
+   "aliases": [
+    "电工证",
+    "初级电工",
+    "中级电工",
+    "电子装配",
+    "认证",
+    "职业资格"
+   ]
+  }
+ },
+ "department": "制造/售后",
+ "role": "电子维修"
+}
